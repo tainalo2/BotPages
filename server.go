@@ -34,11 +34,15 @@ type Site struct {
 	Visibility string `json:"visibility"`
 }
 type Server struct {
-	cfg Config
-	mu  sync.Mutex
+	cfg    Config
+	mu     sync.Mutex
 	limits map[string]rateWindow
 }
-type rateWindow struct { start time.Time; count int }
+type rateWindow struct {
+	start time.Time
+	count int
+}
+
 const maxSiteBytes int64 = 512 << 20
 const maxAssetBytes int64 = 32 << 20
 
@@ -46,7 +50,7 @@ func NewServer(c Config) (*Server, error) {
 	if c.Dir == "" || c.AdminToken == "" {
 		return nil, errors.New("data directory and admin token required")
 	}
-	if (c.AdminHost == "") != (c.ContentHost == "") || (c.AdminHost != "" && (c.AdminHost == c.ContentHost || strings.ContainsAny(c.AdminHost+c.ContentHost, "/:*"))) {
+	if (c.AdminHost == "") != (c.ContentHost == "") || (c.AdminHost != "" && strings.ContainsAny(c.AdminHost+c.ContentHost, "/:*")) {
 		return nil, errors.New("distinct admin and content hosts must be configured together")
 	}
 	if err := os.MkdirAll(c.Dir, 0700); err != nil {
@@ -77,13 +81,19 @@ func (s *Server) authorizedReader(r *http.Request, site string) bool {
 }
 func (s *Server) allowWrite(r *http.Request) bool {
 	actor, _ := s.actor(r)
-	if actor == "" { return true }
+	if actor == "" {
+		return true
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
 	v := s.limits[actor]
-	if now.Sub(v.start) >= time.Minute { v = rateWindow{start: now} }
-	if v.count >= 60 { return false }
+	if now.Sub(v.start) >= time.Minute {
+		v = rateWindow{start: now}
+	}
+	if v.count >= 60 {
+		return false
+	}
 	v.count++
 	s.limits[actor] = v
 	return true
@@ -91,15 +101,27 @@ func (s *Server) allowWrite(r *http.Request) bool {
 func (s *Server) withinQuota(name, target string, incoming int64) bool {
 	var size int64
 	err := filepath.Walk(filepath.Join(s.cfg.Dir, name), func(_ string, info os.FileInfo, err error) error {
-		if err != nil { return err }
-		if info.Mode().IsRegular() && !strings.HasPrefix(info.Name(), ".upload-") && !strings.HasPrefix(info.Name(), ".asset-") { size += info.Size() }
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() && !strings.HasPrefix(info.Name(), ".upload-") && !strings.HasPrefix(info.Name(), ".asset-") {
+			size += info.Size()
+		}
 		return nil
 	})
-	if err != nil { return false }
-	if st, err := os.Stat(target); err == nil { size -= st.Size() }
-	if st, err := os.Stat(target+".previous"); err == nil { size -= st.Size() }
-	if st, err := os.Stat(target); err == nil { size += st.Size() } // previous copy retained for rollback
-	return size + incoming <= maxSiteBytes
+	if err != nil {
+		return false
+	}
+	if st, err := os.Stat(target); err == nil {
+		size -= st.Size()
+	}
+	if st, err := os.Stat(target + ".previous"); err == nil {
+		size -= st.Size()
+	}
+	if st, err := os.Stat(target); err == nil {
+		size += st.Size()
+	} // previous copy retained for rollback
+	return size+incoming <= maxSiteBytes
 }
 func safeName(v string) bool {
 	if v == "" || len(v) > 100 || v == "." || v == ".." {
@@ -111,6 +133,16 @@ func safeName(v string) bool {
 		}
 	}
 	return true
+}
+
+// Active document formats besides HTML may execute script outside the HTML sandbox
+// (for example PDF plugins or SVG navigation), so never publish them as assets.
+func unsafeDocumentPath(v string) bool {
+	switch strings.ToLower(path.Ext(v)) {
+	case ".svg", ".svgz", ".xml", ".xhtml", ".xht", ".pdf", ".mhtml", ".mht", ".shtml":
+		return true
+	}
+	return false
 }
 func safePath(v string) bool {
 	return v != "" && len(v) < 300 && !strings.HasPrefix(v, "/") && !strings.Contains(v, "\\") && !strings.Contains(v, "//") && path.Clean(v) == v && !strings.HasPrefix(v, "../") && v != ".." && !strings.HasPrefix(v, ".") && !strings.Contains(v, "/.")
@@ -177,7 +209,7 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 		http.Error(w, "invalid JSON or exceeds 8 MiB", 400)
 		return
 	}
-	if !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || in.Path == "site.json" || (!admin && actor != in.Site) {
+	if !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || unsafeDocumentPath(in.Path) || in.Path == "site.json" || (!admin && actor != in.Site) {
 		http.Error(w, "invalid site or path", 403)
 		return
 	}
@@ -229,38 +261,79 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 		http.Error(w, "server error", 500)
 		return
 	}
-	if !s.withinQuota(in.Site, target, int64(len(in.Content))) { http.Error(w, "site quota exceeded", 413); return }
-	if err = backup(target); err != nil { http.Error(w, "backup failed", 500); return }
-	if err = os.Rename(tmp.Name(), target); err != nil { http.Error(w, "server error", 500); return }
+	if !s.withinQuota(in.Site, target, int64(len(in.Content))) {
+		http.Error(w, "site quota exceeded", 413)
+		return
+	}
+	if err = backup(target); err != nil {
+		http.Error(w, "backup failed", 500)
+		return
+	}
+	if err = os.Rename(tmp.Name(), target); err != nil {
+		http.Error(w, "server error", 500)
+		return
+	}
 	respond(w, 201, map[string]string{"site": site.Name, "slug": site.Slug, "url": s.pageURL(site.Slug, in.Path)})
 }
 func (s *Server) pageURL(slug, file string) string {
-	if s.cfg.ContentHost != "" { return "https://" + slug + "." + s.cfg.ContentHost + "/p/" + slug + "/" + file }
+	if s.cfg.ContentHost != "" {
+		if s.cfg.AdminHost == s.cfg.ContentHost {
+			return "https://" + s.cfg.ContentHost + "/p/" + slug + "/" + file
+		}
+		return "https://" + slug + "." + s.cfg.ContentHost + "/p/" + slug + "/" + file
+	}
 	return "/p/" + slug + "/" + file
 }
 func backup(target string) error {
 	b, err := os.ReadFile(target)
-	if os.IsNotExist(err) { return nil }
-	if err != nil { return err }
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(target), ".previous-")
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer os.Remove(tmp.Name())
-	if _, err = tmp.Write(b); err != nil { tmp.Close(); return err }
-	if err = tmp.Close(); err != nil { return err }
+	if _, err = tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
 	return os.Rename(tmp.Name(), target+".previous")
 }
 func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 	a, admin := s.actor(r)
-	var in struct { Site string `json:"site"`; Path string `json:"path"` }
+	var in struct {
+		Site string `json:"site"`
+		Path string `json:"path"`
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	if a == "" || json.NewDecoder(r.Body).Decode(&in) != nil || !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || (!admin && a != in.Site) { http.Error(w, "invalid rollback request", 403); return }
-	s.mu.Lock(); defer s.mu.Unlock()
+	if a == "" || json.NewDecoder(r.Body).Decode(&in) != nil || !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || (!admin && a != in.Site) {
+		http.Error(w, "invalid rollback request", 403)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	site, err := s.site(in.Site)
-	if err != nil { http.NotFound(w,r); return }
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	target := filepath.Join(s.cfg.Dir, in.Site, site.Slug, filepath.FromSlash(in.Path))
-	if _, err := os.Stat(target+".previous"); err != nil { http.NotFound(w,r); return }
-	if err := os.Rename(target+".previous", target); err != nil { http.Error(w,"rollback failed",500); return }
-	respond(w, 200, map[string]string{"url":s.pageURL(site.Slug,in.Path)})
+	if _, err := os.Stat(target + ".previous"); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := os.Rename(target+".previous", target); err != nil {
+		http.Error(w, "rollback failed", 500)
+		return
+	}
+	respond(w, 200, map[string]string{"url": s.pageURL(site.Slug, in.Path)})
 }
 func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	actor, admin := s.actor(r)
@@ -270,7 +343,7 @@ func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/api/assets/")
 	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) != 2 || !safeName(parts[0]) || !safePath(parts[1]) || strings.HasSuffix(parts[1], ".previous") || (!admin && actor != parts[0]) {
+	if len(parts) != 2 || !safeName(parts[0]) || !safePath(parts[1]) || strings.HasSuffix(parts[1], ".previous") || unsafeDocumentPath(parts[1]) || (!admin && actor != parts[0]) {
 		http.Error(w, "invalid site or path", 403)
 		return
 	}
@@ -304,9 +377,18 @@ func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st, err := os.Stat(tmp.Name())
-	if err != nil || !s.withinQuota(site.Name, target, st.Size()) { http.Error(w, "site quota exceeded", 413); return }
-	if err = backup(target); err != nil { http.Error(w, "backup failed", 500); return }
-	if err = os.Rename(tmp.Name(), target); err != nil { http.Error(w, "server error", 500); return }
+	if err != nil || !s.withinQuota(site.Name, target, st.Size()) {
+		http.Error(w, "site quota exceeded", 413)
+		return
+	}
+	if err = backup(target); err != nil {
+		http.Error(w, "backup failed", 500)
+		return
+	}
+	if err = os.Rename(tmp.Name(), target); err != nil {
+		http.Error(w, "server error", 500)
+		return
+	}
 	respond(w, 201, map[string]string{"url": s.pageURL(site.Slug, parts[1])})
 }
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +415,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 func (s *Server) servePage(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/p/")
 	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) != 2 || len(parts[0]) != 36 || !safePath(parts[1]) || strings.HasSuffix(parts[1], ".previous") {
+	if len(parts) != 2 || len(parts[0]) != 36 || !safePath(parts[1]) || strings.HasSuffix(parts[1], ".previous") || unsafeDocumentPath(parts[1]) {
 		http.NotFound(w, r)
 		return
 	}
@@ -360,7 +442,7 @@ func (s *Server) servePage(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Cache-Control", "private, no-store")
-		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "sandbox allow-scripts; frame-ancestors 'none'")
 		w.Header().Set("Origin-Agent-Cluster", "?1")
 		if typ := mime.TypeByExtension(path.Ext(file)); typ != "" {
 			w.Header().Set("Content-Type", typ)
@@ -382,12 +464,15 @@ func (s *Server) servePage(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/health" && r.Method == "GET" { respond(w, 200, map[string]string{"status":"ok"}); return }
+	if r.URL.Path == "/health" && r.Method == "GET" {
+		respond(w, 200, map[string]string{"status": "ok"})
+		return
+	}
 	if s.cfg.AdminHost != "" && s.cfg.ContentHost != "" {
 		h := strings.ToLower(strings.Split(r.Host, ":")[0])
 		if strings.HasPrefix(r.URL.Path, "/p/") {
 			slug := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/p/"), "/", 2)[0]
-			if len(slug) != 36 || h != slug+"."+s.cfg.ContentHost {
+			if len(slug) != 36 || (s.cfg.AdminHost != s.cfg.ContentHost && h != slug+"."+s.cfg.ContentHost) || (s.cfg.AdminHost == s.cfg.ContentHost && h != s.cfg.AdminHost) {
 				http.NotFound(w, r)
 				return
 			}
@@ -397,7 +482,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if (r.Method == "POST" || r.Method == "PUT") && r.URL.Path != "/mcp" && !s.allowWrite(r) {
-		w.Header().Set("Retry-After", "60"); http.Error(w, "rate limited", 429); return
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limited", 429)
+		return
 	}
 	switch {
 	case r.URL.Path == "/health" && r.Method == "GET":
