@@ -44,6 +44,9 @@ type rateWindow struct {
 	count int
 }
 
+// version est injectée à la compilation : -ldflags "-X main.version=1.2.3".
+var version = "dev"
+
 const maxSiteBytes int64 = 512 << 20
 const maxAssetBytes int64 = 32 << 20
 
@@ -518,7 +521,7 @@ func (s *Server) servePage(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/health" && r.Method == "GET" {
-		respond(w, 200, map[string]string{"status": "ok"})
+		respond(w, 200, map[string]string{"status": "ok", "version": version})
 		return
 	}
 	if s.cfg.AdminHost != "" && s.cfg.ContentHost != "" {
@@ -541,7 +544,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/health" && r.Method == "GET":
-		respond(w, 200, map[string]string{"status": "ok"})
+		respond(w, 200, map[string]string{"status": "ok", "version": version})
 	case r.URL.Path == "/api/publish" && r.Method == "POST":
 		a, admin := s.actor(r)
 		s.publish(w, r, a, admin)
@@ -581,6 +584,6 @@ func main() {
 	if addr == "" {
 		addr = ":8080"
 	}
-	fmt.Println("BotPages listening on", addr)
+	fmt.Println("BotPages", version, "listening on", addr)
 	log.Fatal(http.ListenAndServe(addr, s))
 }

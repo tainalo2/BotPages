@@ -38,7 +38,7 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 	var result any
 	switch q.Method {
 	case "initialize":
-		result = map[string]any{"protocolVersion": "2025-03-26", "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]string{"name": "botpages", "version": "0.1.0"}}
+		result = map[string]any{"protocolVersion": "2025-03-26", "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]string{"name": "botpages", "version": version}}
 	case "ping":
 		result = map[string]any{}
 	case "tools/list":

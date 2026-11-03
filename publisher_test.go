@@ -132,3 +132,18 @@ func TestBotIdentityHeaderSanitized(t *testing.T) {
 		}
 	}
 }
+
+func TestHealthReportsVersion(t *testing.T) {
+	s := setupPublisher(t)
+	old := version
+	version = "9.8.7"
+	defer func() { version = old }()
+	w := call(s, "GET", "/health", "", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"version":"9.8.7"`) {
+		t.Fatalf("health %d %s", w.Code, w.Body.String())
+	}
+	w = call(s, "POST", "/mcp", "pub-secret", []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	if !strings.Contains(w.Body.String(), `"version":"9.8.7"`) {
+		t.Fatalf("mcp serverInfo %s", w.Body.String())
+	}
+}

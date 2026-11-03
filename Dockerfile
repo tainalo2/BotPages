@@ -5,10 +5,13 @@ RUN npm install --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
 FROM golang:1.24-alpine AS backend
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod *.go ./
-RUN go test ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /botpages .
+RUN go test ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /botpages .
 FROM alpine:3.21
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="BotPages" org.opencontainers.image.version="${VERSION}" org.opencontainers.image.source="https://github.com/tainalo2/BotPages"
 RUN addgroup -S app && adduser -S -G app app && mkdir /data && chown app:app /data
 COPY --from=backend /botpages /usr/local/bin/botpages
 COPY --from=ui /web/dist /admin

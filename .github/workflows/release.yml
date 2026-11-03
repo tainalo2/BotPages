@@ -1,0 +1,156 @@
+name: Release
+
+# Publie une version installable de BotPages :
+#   - image ghcr.io/tainalo2/botpages:X.Y.Z (+ latest), étiquette Git vX.Y.Z et release GitHub ;
+#   - MyInfra repère les tags X.Y.Z plus récents et propose la mise à jour sur place.
+# Déclenchement : bouton « Run workflow » (incrément patch/minor/major ou version explicite)
+# depuis main, ou push d'une étiquette vX.Y.Z.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Incrément semver (ignoré si une version est fournie)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Version explicite X.Y.Z (facultatif)
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/tainalo2/botpages
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -Ev "^v${GITHUB_REF_NAME#v}$" | head -n1 || true)
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+            create_tag=false
+          else
+            if [ "$GITHUB_REF_NAME" != "main" ]; then
+              echo "::error::Une release se lance depuis main."; exit 1
+            fi
+            if [ -n "$INPUT_VERSION" ]; then
+              v="${INPUT_VERSION#v}"
+            elif [ -z "$last" ]; then
+              v=0.1.0
+            else
+              IFS=. read -r ma mi pa <<< "${last#v}"
+              case "$INPUT_BUMP" in
+                major) v="$((ma + 1)).0.0" ;;
+                minor) v="$ma.$((mi + 1)).0" ;;
+                *)     v="$ma.$mi.$((pa + 1))" ;;
+              esac
+            fi
+            create_tag=true
+            if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+              echo "::error::L'étiquette v$v existe déjà."; exit 1
+            fi
+          fi
+          if ! echo "$v" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::Version invalide : $v (attendu X.Y.Z)"; exit 1
+          fi
+          if [ -n "$last" ]; then
+            top=$(printf '%s\n%s\n' "${last#v}" "$v" | sort -V | tail -n1)
+            if [ "$top" != "$v" ] || [ "$v" = "${last#v}" ]; then
+              echo "::error::$v doit être supérieure à la dernière version ${last#v}."; exit 1
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "create_tag=$create_tag" >> "$GITHUB_OUTPUT"
+          echo "previous=$last" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, test and publish
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: VERSION=${{ steps.v.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Smoke test the published image
+        env:
+          V: ${{ steps.v.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 18080:8080 -e BOTPAGES_ADMIN_TOKEN="$(openssl rand -hex 16)" "$IMAGE@$DIGEST"
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/health > health.json && break; sleep 1; done
+          cat health.json
+          grep -q "\"version\":\"$V\"" health.json
+          docker rm -f smoke
+
+      - name: Tag and publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          CREATE_TAG: ${{ steps.v.outputs.create_tag }}
+          PREVIOUS: ${{ steps.v.outputs.previous }}
+        run: |
+          set -euo pipefail
+          if [ "$CREATE_TAG" = "true" ]; then
+            git tag "v$V" "$GITHUB_SHA"
+            git push origin "v$V"
+          fi
+          args=(-f tag_name="v$V" -f target_commitish="$GITHUB_SHA")
+          if [ -n "$PREVIOUS" ]; then args+=(-f previous_tag_name="$PREVIOUS"); fi
+          generated=$(gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" "${args[@]}" --jq .body)
+          {
+            echo "## Image"
+            echo
+            echo "- \`$IMAGE:$V\`"
+            echo "- digest \`$DIGEST\`"
+            echo "- épinglée : \`$IMAGE:$V@$DIGEST\`"
+            echo
+            echo "Mise à jour MyInfra : l'application doit suivre une étiquette X.Y.Z ; \`update_application\` propose alors cette version et remplace l'image sur place (volume conservé)."
+            echo
+            echo "$generated"
+          } > notes.md
+          gh release create "v$V" --verify-tag --title "BotPages v$V" --notes-file notes.md
+          {
+            echo "### BotPages v$V"
+            echo "- Image : \`$IMAGE:$V\`"
+            echo "- Digest : \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
