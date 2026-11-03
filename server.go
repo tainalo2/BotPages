@@ -23,6 +23,7 @@ type Config struct {
 	Dir         string
 	AdminToken  string
 	Bots        map[string]string
+	Publishers  map[string]string // jetons partagés : publient sur tout site non répertorié
 	Readers     map[string]map[string]string
 	AdminDir    string
 	AdminHost   string
@@ -50,6 +51,11 @@ func NewServer(c Config) (*Server, error) {
 	if c.Dir == "" || c.AdminToken == "" {
 		return nil, errors.New("data directory and admin token required")
 	}
+	for _, token := range c.Publishers {
+		if token == "" || equal(token, c.AdminToken) {
+			return nil, errors.New("publisher tokens must be non-empty and differ from the admin token")
+		}
+	}
 	if (c.AdminHost == "") != (c.ContentHost == "") || (c.AdminHost != "" && strings.ContainsAny(c.AdminHost+c.ContentHost, "/:*")) {
 		return nil, errors.New("distinct admin and content hosts must be configured together")
 	}
@@ -69,7 +75,35 @@ func (s *Server) actor(r *http.Request) (string, bool) {
 			return name, false
 		}
 	}
+	for name, token := range s.cfg.Publishers {
+		if token != "" && h != "" && equal(h, token) {
+			return "publisher/" + name, false // « / » ne peut jamais égaler un nom de site
+		}
+	}
 	return "", false
+}
+
+// isPublisher : jeton partagé des bots, limité aux sites non répertoriés.
+func isPublisher(actor string) bool { return strings.HasPrefix(actor, "publisher/") }
+
+// mayWrite : l'admin écrit partout, un bot sur son site, un publisher sur tout site
+// (la restriction aux sites non répertoriés est vérifiée une fois le site chargé).
+func mayWrite(actor string, admin bool, site string) bool {
+	return admin || (actor != "" && actor == site) || isPublisher(actor)
+}
+
+// botIdentity : nom déclaratif du bot appelant (en-tête X-BotPages-Bot), pour les journaux
+// uniquement ; ce n'est jamais une autorisation.
+func botIdentity(r *http.Request) string {
+	v := r.Header.Get("X-BotPages-Bot")
+	if len(v) > 40 || !safeName(v) {
+		return "-"
+	}
+	return v
+}
+
+func audit(r *http.Request, action, actor, site, file string) {
+	log.Printf("audit action=%s actor=%s bot=%s site=%s path=%q", action, actor, botIdentity(r), site, file)
 }
 func (s *Server) authorizedReader(r *http.Request, site string) bool {
 	u, p, ok := r.BasicAuth()
@@ -209,7 +243,7 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 		http.Error(w, "invalid JSON or exceeds 8 MiB", 400)
 		return
 	}
-	if !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || unsafeDocumentPath(in.Path) || in.Path == "site.json" || (!admin && actor != in.Site) {
+	if !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || unsafeDocumentPath(in.Path) || in.Path == "site.json" || !mayWrite(actor, admin, in.Site) {
 		http.Error(w, "invalid site or path", 403)
 		return
 	}
@@ -236,6 +270,9 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 		}
 	} else if err != nil {
 		http.Error(w, "server error", 500)
+		return
+	} else if isPublisher(actor) && site.Visibility != "unlisted" {
+		http.Error(w, "protected site requires admin", 403)
 		return
 	} else if in.Visibility != "" && in.Visibility != site.Visibility {
 		http.Error(w, "visibility cannot change with publication", 403)
@@ -273,6 +310,7 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 		http.Error(w, "server error", 500)
 		return
 	}
+	audit(r, "publish", actor, site.Name, in.Path)
 	respond(w, 201, map[string]string{"site": site.Name, "slug": site.Slug, "url": s.pageURL(site.Slug, in.Path)})
 }
 func (s *Server) pageURL(slug, file string) string {
@@ -313,7 +351,7 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 		Path string `json:"path"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	if a == "" || json.NewDecoder(r.Body).Decode(&in) != nil || !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || (!admin && a != in.Site) {
+	if a == "" || json.NewDecoder(r.Body).Decode(&in) != nil || !safeName(in.Site) || !safePath(in.Path) || strings.HasSuffix(in.Path, ".previous") || !mayWrite(a, admin, in.Site) {
 		http.Error(w, "invalid rollback request", 403)
 		return
 	}
@@ -322,6 +360,10 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 	site, err := s.site(in.Site)
 	if err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if isPublisher(a) && site.Visibility != "unlisted" {
+		http.Error(w, "protected site requires admin", 403)
 		return
 	}
 	target := filepath.Join(s.cfg.Dir, in.Site, site.Slug, filepath.FromSlash(in.Path))
@@ -333,6 +375,7 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rollback failed", 500)
 		return
 	}
+	audit(r, "rollback", a, site.Name, in.Path)
 	respond(w, 200, map[string]string{"url": s.pageURL(site.Slug, in.Path)})
 }
 func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
@@ -343,7 +386,7 @@ func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/api/assets/")
 	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) != 2 || !safeName(parts[0]) || !safePath(parts[1]) || strings.HasSuffix(parts[1], ".previous") || unsafeDocumentPath(parts[1]) || (!admin && actor != parts[0]) {
+	if len(parts) != 2 || !safeName(parts[0]) || !safePath(parts[1]) || strings.HasSuffix(parts[1], ".previous") || unsafeDocumentPath(parts[1]) || !mayWrite(actor, admin, parts[0]) {
 		http.Error(w, "invalid site or path", 403)
 		return
 	}
@@ -352,6 +395,10 @@ func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	site, err := s.site(parts[0])
 	if err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if isPublisher(actor) && site.Visibility != "unlisted" {
+		http.Error(w, "protected site requires admin", 403)
 		return
 	}
 	target := filepath.Join(s.cfg.Dir, site.Name, site.Slug, filepath.FromSlash(parts[1]))
@@ -389,6 +436,7 @@ func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", 500)
 		return
 	}
+	audit(r, "asset", actor, site.Name, parts[1])
 	respond(w, 201, map[string]string{"url": s.pageURL(site.Slug, parts[1])})
 }
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
@@ -404,10 +452,15 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []Site{}
 	for _, e := range entries {
-		if e.IsDir() && (admin || e.Name() == actor) {
-			if site, err := s.site(e.Name()); err == nil {
-				out = append(out, site)
-			}
+		if !e.IsDir() {
+			continue
+		}
+		site, err := s.site(e.Name())
+		if err != nil {
+			continue
+		}
+		if admin || e.Name() == actor || (isPublisher(actor) && site.Visibility == "unlisted") {
+			out = append(out, site)
 		}
 	}
 	respond(w, 200, out)
@@ -512,9 +565,11 @@ func (s *Server) actorAdmin(r *http.Request) (string, bool) { a, admin := s.acto
 func loadConfig() Config {
 	bots := map[string]string{}
 	readers := map[string]map[string]string{}
+	publishers := map[string]string{}
 	_ = json.Unmarshal([]byte(os.Getenv("BOTPAGES_BOT_TOKENS")), &bots)
+	_ = json.Unmarshal([]byte(os.Getenv("BOTPAGES_PUBLISHER_TOKENS")), &publishers)
 	_ = json.Unmarshal([]byte(os.Getenv("BOTPAGES_READERS")), &readers)
-	return Config{Dir: os.Getenv("BOTPAGES_DATA"), AdminToken: os.Getenv("BOTPAGES_ADMIN_TOKEN"), Bots: bots, Readers: readers, AdminDir: os.Getenv("BOTPAGES_ADMIN_DIR"), AdminHost: os.Getenv("BOTPAGES_ADMIN_HOST"), ContentHost: os.Getenv("BOTPAGES_CONTENT_HOST")}
+	return Config{Dir: os.Getenv("BOTPAGES_DATA"), AdminToken: os.Getenv("BOTPAGES_ADMIN_TOKEN"), Bots: bots, Publishers: publishers, Readers: readers, AdminDir: os.Getenv("BOTPAGES_ADMIN_DIR"), AdminHost: os.Getenv("BOTPAGES_ADMIN_HOST"), ContentHost: os.Getenv("BOTPAGES_CONTENT_HOST")}
 }
 func main() {
 	c := loadConfig()

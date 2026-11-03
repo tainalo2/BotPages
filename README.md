@@ -9,10 +9,11 @@ Service Go léger de publication de pages statiques pour les bots, avec panel Re
 - Publication HTML/CSS/JS par API JSON, fichiers binaires par API PUT (32 MiB maximum), sites et fichiers listables dans le panel.
 - MCP Streamable HTTP (`POST /mcp`) : `initialize`, `tools/list`, `tools/call` (`publish_page`, `list_sites`). Les assets volumineux passent par l’API HTTP.
 - Jeton par bot limité au site de même nom ; création de site protégé réservée à l’administrateur.
+- Jeton **publisher** partagé (`BOTPAGES_PUBLISHER_TOKENS`, objet JSON `{"publisher":"..."}`) : publie, téléverse et restaure sur **tout site non répertorié**, crée uniquement des sites non répertoriés, ne voit ni ne modifie les sites protégés et n’a aucun droit d’administration. L’en-tête facultatif `X-BotPages-Bot: <nom>` est journalisé (`audit action=… actor=… bot=…`) pour l’attribution ; ce n’est pas une autorisation.
 
 ## Configuration
 
-Variables obligatoires : `BOTPAGES_ADMIN_TOKEN`, `BOTPAGES_DATA`. Variables optionnelles : `BOTPAGES_BOT_TOKENS` (objet JSON `{"newser":"..."}`), `BOTPAGES_READERS` (objet JSON par site `{"private":{"utilisateur":"mot-de-passe"}}`), `BOTPAGES_ADMIN_HOST` et `BOTPAGES_CONTENT_HOST` (obligatoirement ensemble ; identiques pour le mode domaine fixe), `BOTPAGES_ADMIN_DIR`, `BOTPAGES_ADDR`. Aucun secret n’est inclus dans le dépôt ou l’image. Le port par défaut est 8080, les données persistent dans `/data`.
+Variables obligatoires : `BOTPAGES_ADMIN_TOKEN`, `BOTPAGES_DATA`. Variables optionnelles : `BOTPAGES_BOT_TOKENS` (objet JSON `{"newser":"..."}`), `BOTPAGES_PUBLISHER_TOKENS` (objet JSON `{"publisher":"..."}`, jeton différent du jeton admin), `BOTPAGES_READERS` (objet JSON par site `{"private":{"utilisateur":"mot-de-passe"}}`), `BOTPAGES_ADMIN_HOST` et `BOTPAGES_CONTENT_HOST` (obligatoirement ensemble ; identiques pour le mode domaine fixe), `BOTPAGES_ADMIN_DIR`, `BOTPAGES_ADDR`. Aucun secret n’est inclus dans le dépôt ou l’image. Le port par défaut est 8080, les données persistent dans `/data`.
 
 L’administration se trouve sur `/admin/`. Le jeton saisi par l’utilisateur reste en mémoire dans l’onglet, non stocké par le navigateur. Pour publier : `POST /api/publish` avec un JSON `{ "site":"newser", "path":"index.html", "content":"<h1>...", "visibility":"unlisted" }` et `Authorization: Bearer <jeton>`. Les binaires utilisent `PUT /api/assets/<site>/<chemin>` avec le corps brut.
 

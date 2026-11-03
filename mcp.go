@@ -20,7 +20,11 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
-	if !s.allowWrite(r) { w.Header().Set("Retry-After", "60"); http.Error(w, "rate limited", 429); return }
+	if !s.allowWrite(r) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limited", 429)
+		return
+	}
 	var q request
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
 	if json.NewDecoder(r.Body).Decode(&q) != nil || q.JSONRPC != "2.0" {
@@ -38,7 +42,7 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		result = map[string]any{}
 	case "tools/list":
-		result = map[string]any{"tools": []any{map[string]any{"name": "publish_page", "description": "Publish one HTML/CSS/JS file to a site", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"site": map[string]string{"type": "string"}, "path": map[string]string{"type": "string"}, "content": map[string]string{"type": "string"}}, "required": []string{"site", "path", "content"}}}, map[string]any{"name": "list_sites", "description": "List sites visible to the bot", "inputSchema": map[string]any{"type": "object"}}}}
+		result = map[string]any{"tools": []any{map[string]any{"name": "publish_page", "description": "Publish one HTML/CSS/JS file to a site", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"site": map[string]string{"type": "string", "description": "Site name (lowercase, digits, dashes); a publisher token may use any unlisted site"}, "path": map[string]string{"type": "string", "description": "File path inside the site, e.g. veille/2026-11-03/index.html"}, "content": map[string]string{"type": "string", "description": "UTF-8 file content (HTML, CSS, JS, JSON, text)"}}, "required": []string{"site", "path", "content"}}}, map[string]any{"name": "list_sites", "description": "List sites visible to the bot", "inputSchema": map[string]any{"type": "object"}}}}
 	case "tools/call":
 		var p struct {
 			Name      string          `json:"name"`
