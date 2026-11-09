@@ -112,10 +112,13 @@ func (s *Server) allowWrite(r *http.Request) bool {
 	if actor == "" {
 		return true
 	}
+	// Multiple SQLite credentials may authorize the same actor/site. The
+	// application limit is per credential, never shared through actor scope.
+	limitKey := hashToken(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	v := s.limits[actor]
+	v := s.limits[limitKey]
 	if now.Sub(v.start) >= time.Minute {
 		v = rateWindow{start: now}
 	}
@@ -123,7 +126,7 @@ func (s *Server) allowWrite(r *http.Request) bool {
 		return false
 	}
 	v.count++
-	s.limits[actor] = v
+	s.limits[limitKey] = v
 	return true
 }
 func (s *Server) withinQuota(name, target string, incoming int64) bool {

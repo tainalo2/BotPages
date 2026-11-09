@@ -101,6 +101,45 @@ func TestAdminTokenCRUDAndImmediateRevocation(t *testing.T) {
 	}
 }
 
+func TestRateLimitIsPerSQLiteToken(t *testing.T) {
+	s, err := NewServer(Config{Dir: t.TempDir(), AdminToken: "admin-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	createToken := func(name string) string {
+		t.Helper()
+		body := []byte(`{"name":"` + name + `","kind":"bot","site_scope":"shared-site"}`)
+		w := call(s, http.MethodPost, "/api/admin/tokens", "admin-secret", body)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", name, w.Code, w.Body.String())
+		}
+		var created struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+			t.Fatal(err)
+		}
+		return created.Token
+	}
+	first := createToken("first")
+	second := createToken("second")
+
+	for i := 0; i < 60; i++ {
+		w := call(s, http.MethodPost, "/api/publish", first, []byte(`{}`))
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("first token limited early at request %d", i+1)
+		}
+	}
+	if w := call(s, http.MethodPost, "/api/publish", first, []byte(`{}`)); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("first token exceeded limit: %d %s", w.Code, w.Body.String())
+	}
+	if w := publishAs(s, second, "shared-site", "index.html", "unlisted"); w.Code != http.StatusCreated {
+		t.Fatalf("second token shared the first token's rate limit: %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestPublisherCreatedByAdminKeepsUnlistedScope(t *testing.T) {
 	s, err := NewServer(Config{Dir: t.TempDir(), AdminToken: "admin-secret"})
 	if err != nil {
