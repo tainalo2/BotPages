@@ -2,6 +2,10 @@
 
 Format : [SemVer](https://semver.org/lang/fr/). Chaque version est publiée par le workflow `Release` (image `ghcr.io/tainalo2/botpages:X.Y.Z`, release GitHub avec digest).
 
+## Non publié
+- Identités bots et publishers migrées dans SQLite avec jetons condensés, import unique des anciennes variables d’environnement et révocation immédiate.
+- API et panel d’administration pour créer, lister et révoquer les identités.
+
 ## 0.2.1
 - Journal des versions et procédure de mise à jour documentés. Version de contrôle du mécanisme de mise à jour MyInfra (remplacement sur place, volume conservé).
 

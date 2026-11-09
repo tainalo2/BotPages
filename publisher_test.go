@@ -17,6 +17,7 @@ func setupPublisher(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 

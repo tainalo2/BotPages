@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,9 +36,10 @@ type Site struct {
 	Visibility string `json:"visibility"`
 }
 type Server struct {
-	cfg    Config
-	mu     sync.Mutex
-	limits map[string]rateWindow
+	cfg        Config
+	identities *identityStore
+	mu         sync.Mutex
+	limits     map[string]rateWindow
 }
 type rateWindow struct {
 	start time.Time
@@ -54,18 +56,20 @@ func NewServer(c Config) (*Server, error) {
 	if c.Dir == "" || c.AdminToken == "" {
 		return nil, errors.New("data directory and admin token required")
 	}
-	for _, token := range c.Publishers {
-		if token == "" || equal(token, c.AdminToken) {
-			return nil, errors.New("publisher tokens must be non-empty and differ from the admin token")
-		}
-	}
+
 	if (c.AdminHost == "") != (c.ContentHost == "") || (c.AdminHost != "" && strings.ContainsAny(c.AdminHost+c.ContentHost, "/:*")) {
 		return nil, errors.New("distinct admin and content hosts must be configured together")
 	}
 	if err := os.MkdirAll(c.Dir, 0700); err != nil {
 		return nil, err
 	}
-	return &Server{cfg: c, limits: make(map[string]rateWindow)}, nil
+	identities, err := openIdentityStore(c.Dir, c.AdminToken, c.Bots, c.Publishers)
+	if err != nil {
+		return nil, err
+	}
+	c.Bots = nil
+	c.Publishers = nil
+	return &Server{cfg: c, identities: identities, limits: make(map[string]rateWindow)}, nil
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
@@ -73,18 +77,17 @@ func (s *Server) actor(r *http.Request) (string, bool) {
 	if h != "" && equal(h, s.cfg.AdminToken) {
 		return "admin", true
 	}
-	for name, token := range s.cfg.Bots {
-		if token != "" && equal(h, token) {
-			return name, false
-		}
+	identity, ok, err := s.identities.authenticate(h)
+	if err != nil || !ok {
+		return "", false
 	}
-	for name, token := range s.cfg.Publishers {
-		if token != "" && h != "" && equal(h, token) {
-			return "publisher/" + name, false // « / » ne peut jamais égaler un nom de site
-		}
+	if identity.SiteScope == publisherScope {
+		return "publisher/" + identity.Name, false // « / » ne peut jamais égaler un nom de site
 	}
-	return "", false
+	return identity.SiteScope, false
 }
+
+func (s *Server) Close() error { return s.identities.close() }
 
 // isPublisher : jeton partagé des bots, limité aux sites non répertoriés.
 func isPublisher(actor string) bool { return strings.HasPrefix(actor, "publisher/") }
@@ -188,6 +191,78 @@ func respond(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) revokeIdentity(w http.ResponseWriter, r *http.Request, publisher bool) {
+	_, admin := s.actor(r)
+	if !admin {
+		http.Error(w, "admin required", http.StatusUnauthorized)
+		return
+	}
+	prefix := "/api/admin/bots/"
+	if publisher {
+		prefix = "/api/admin/publishers/"
+	}
+	id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, prefix), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	updated, err := s.identities.revoke(id, publisher)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if !updated {
+		http.NotFound(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) listIdentities(w http.ResponseWriter, r *http.Request, publisher bool) {
+	_, admin := s.actor(r)
+	if !admin {
+		http.Error(w, "admin required", http.StatusUnauthorized)
+		return
+	}
+	identities, err := s.identities.list(publisher)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	respond(w, http.StatusOK, identities)
+}
+
+func (s *Server) createIdentity(w http.ResponseWriter, r *http.Request, publisher bool) {
+	_, admin := s.actor(r)
+	if !admin {
+		http.Error(w, "admin required", http.StatusUnauthorized)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var input struct {
+		Name      string `json:"name"`
+		SiteScope string `json:"site_scope"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if publisher {
+		input.SiteScope = publisherScope
+	} else if input.SiteScope == "" {
+		input.SiteScope = input.Name
+	}
+	created, err := s.identities.create(input.Name, input.SiteScope)
+	if err != nil {
+		http.Error(w, "invalid or duplicate identity", http.StatusConflict)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	respond(w, http.StatusCreated, created)
 }
 func newSlug() (string, error) {
 	b := make([]byte, 18)
@@ -550,6 +625,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.publish(w, r, a, admin)
 	case r.URL.Path == "/api/sites" && r.Method == "GET":
 		s.list(w, r)
+	case r.URL.Path == "/api/admin/bots" && r.Method == "GET":
+		s.listIdentities(w, r, false)
+	case r.URL.Path == "/api/admin/bots" && r.Method == "POST":
+		s.createIdentity(w, r, false)
+	case strings.HasPrefix(r.URL.Path, "/api/admin/bots/") && r.Method == "DELETE":
+		s.revokeIdentity(w, r, false)
+	case r.URL.Path == "/api/admin/publishers" && r.Method == "GET":
+		s.listIdentities(w, r, true)
+	case r.URL.Path == "/api/admin/publishers" && r.Method == "POST":
+		s.createIdentity(w, r, true)
+	case strings.HasPrefix(r.URL.Path, "/api/admin/publishers/") && r.Method == "DELETE":
+		s.revokeIdentity(w, r, true)
 	case r.URL.Path == "/api/rollback" && r.Method == "POST":
 		s.rollback(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/assets/") && r.Method == "PUT":
