@@ -21,14 +21,16 @@ import (
 )
 
 type Config struct {
-	Dir         string
-	AdminToken  string
-	Bots        map[string]string
-	Publishers  map[string]string // jetons partagés : publient sur tout site non répertorié
-	Readers     map[string]map[string]string
-	AdminDir    string
-	AdminHost   string
-	ContentHost string
+	Dir               string
+	AdminToken        string
+	Bots              map[string]string
+	Publishers        map[string]string // jetons partagés : publient sur tout site non répertorié
+	Readers           map[string]map[string]string
+	AdminDir          string
+	AdminHost         string
+	ContentHost       string
+	AppHTTPClient     *http.Client // optional test/embedding override; secure default in production
+	MaxConcurrentApps int          // zero uses the secure default
 }
 type Site struct {
 	Name       string `json:"name"`
@@ -36,10 +38,12 @@ type Site struct {
 	Visibility string `json:"visibility"`
 }
 type Server struct {
-	cfg    Config
-	db     *sql.DB
-	mu     sync.Mutex
-	limits map[string]rateWindow
+	cfg       Config
+	db        *sql.DB
+	mu        sync.Mutex
+	limits    map[string]rateWindow
+	appClient *http.Client
+	appSlots  chan struct{}
 }
 type rateWindow struct {
 	start time.Time
@@ -66,7 +70,19 @@ func NewServer(c Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: c, db: db, limits: make(map[string]rateWindow)}, nil
+	client := c.AppHTTPClient
+	if client == nil {
+		client = secureAppHTTPClient()
+	}
+	maxConcurrentApps := c.MaxConcurrentApps
+	if maxConcurrentApps == 0 {
+		maxConcurrentApps = 4
+	}
+	if maxConcurrentApps < 1 || maxConcurrentApps > 64 {
+		db.Close()
+		return nil, errors.New("MaxConcurrentApps must be between 1 and 64")
+	}
+	return &Server{cfg: c, db: db, limits: make(map[string]rateWindow), appClient: client, appSlots: make(chan struct{}, maxConcurrentApps)}, nil
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
@@ -520,8 +536,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.AdminHost != "" && s.cfg.ContentHost != "" {
 		h := strings.ToLower(strings.Split(r.Host, ":")[0])
-		if strings.HasPrefix(r.URL.Path, "/p/") {
-			slug := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/p/"), "/", 2)[0]
+		if strings.HasPrefix(r.URL.Path, "/p/") || strings.HasPrefix(r.URL.Path, "/a/") {
+			prefix := "/p/"
+			if strings.HasPrefix(r.URL.Path, "/a/") {
+				prefix = "/a/"
+			}
+			slug := strings.SplitN(strings.TrimPrefix(r.URL.Path, prefix), "/", 2)[0]
 			if len(slug) != 36 || (s.cfg.AdminHost != s.cfg.ContentHost && h != slug+"."+s.cfg.ContentHost) || (s.cfg.AdminHost == s.cfg.ContentHost && h != s.cfg.AdminHost) {
 				http.NotFound(w, r)
 				return
@@ -542,8 +562,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/publish" && r.Method == "POST":
 		a, admin := s.actor(r)
 		s.publish(w, r, a, admin)
+	case r.URL.Path == "/api/apps" && r.Method == "POST":
+		a, admin := s.actor(r)
+		s.publishApp(w, r, a, admin)
 	case r.URL.Path == "/api/sites" && r.Method == "GET":
 		s.list(w, r)
+	case r.URL.Path == "/api/admin/apps/network" && r.Method == "POST":
+		s.approveAppNetwork(w, r)
 	case r.URL.Path == "/api/admin/tokens" && r.Method == "GET":
 		s.listTokens(w, r)
 	case r.URL.Path == "/api/admin/tokens" && r.Method == "POST":
@@ -556,6 +581,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.uploadAsset(w, r)
 	case r.URL.Path == "/mcp" && r.Method == "POST":
 		s.mcp(w, r)
+	case strings.HasPrefix(r.URL.Path, "/a/"):
+		s.serveApp(w, r)
 	case strings.HasPrefix(r.URL.Path, "/p/") && (r.Method == "GET" || r.Method == "HEAD"):
 		s.servePage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/") && r.Method == "GET" && s.cfg.AdminDir != "":
