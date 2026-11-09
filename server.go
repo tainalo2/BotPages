@@ -48,6 +48,8 @@ type Server struct {
 	appSlotsMu      sync.Mutex
 	appSlotsBySite  map[string]chan struct{}
 	appSlotsPerSite int
+	storageLocksMu  sync.Mutex
+	storageLocks    map[string]*contextMutex
 	siteDatabasesMu sync.Mutex
 	siteDatabases   map[string]*siteDatabase
 }
@@ -110,6 +112,7 @@ func NewServer(c Config) (*Server, error) {
 		appSlots:        make(chan struct{}, maxConcurrentApps),
 		appSlotsBySite:  make(map[string]chan struct{}),
 		appSlotsPerSite: maxConcurrentAppsPerSite,
+		storageLocks:    make(map[string]*contextMutex),
 		siteDatabases:   make(map[string]*siteDatabase),
 	}, nil
 }
@@ -145,6 +148,18 @@ func (s *Server) releaseAppSlot(siteName string) {
 	<-s.appSlots
 	<-s.appSlotForSite(siteName)
 }
+
+func (s *Server) siteStorageLock(siteName string) *contextMutex {
+	s.storageLocksMu.Lock()
+	defer s.storageLocksMu.Unlock()
+	lock := s.storageLocks[siteName]
+	if lock == nil {
+		lock = newContextMutex()
+		s.storageLocks[siteName] = lock
+	}
+	return lock
+}
+
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
 	h := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -403,6 +418,12 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	storageLock := s.siteStorageLock(in.Site)
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	site, err := s.site(in.Site)
 	if os.IsNotExist(err) {
 		if in.Visibility == "" {
@@ -511,6 +532,12 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	storageLock := s.siteStorageLock(in.Site)
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	site, err := s.site(in.Site)
 	if err != nil {
 		http.NotFound(w, r)
@@ -546,6 +573,12 @@ func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	storageLock := s.siteStorageLock(parts[0])
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	site, err := s.site(parts[0])
 	if err != nil {
 		http.NotFound(w, r)

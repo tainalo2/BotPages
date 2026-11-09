@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -189,8 +190,22 @@ func (s *Server) publishApp(w http.ResponseWriter, r *http.Request, actor string
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
+	storageLock := s.siteStorageLock(site.Name)
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	store, err := s.ensureSiteDatabase(site.Name)
 	if err != nil {
+		if errors.Is(err, errSiteDatabaseQuota) {
+			http.Error(w, "site quota exceeded", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.reconcileAppActivation(r.Context(), site, in.Manifest.Name, store); err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
@@ -217,24 +232,31 @@ func (s *Server) publishApp(w http.ResponseWriter, r *http.Request, actor string
 		http.Error(w, "site quota exceeded", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if err := applyMigrations(r.Context(), store, in.Manifest.Name, in.Manifest.Migrations); err != nil {
+	versionID := filepath.Base(tmp + ".ready")
+	migrations, err := prepareMigrations(r.Context(), s, store, site.Name, in.Manifest.Name, versionID, in.Manifest.Migrations)
+	if err != nil {
 		http.Error(w, "invalid migration: "+boundedError(err), http.StatusBadRequest)
 		return
 	}
 	approvalPath := filepath.Join(s.cfg.Dir, site.Name, ".app-approvals", in.Manifest.Name+".json")
-	if err := os.Remove(approvalPath); err != nil {
-		if !os.IsNotExist(err) {
-			http.Error(w, "server error", http.StatusInternalServerError)
-			return
-		}
-	} else if syncDir(filepath.Dir(approvalPath)) != nil {
+	approvalBackup, err := snapshotFile(approvalPath)
+	if err != nil {
+		_ = migrations.Rollback()
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	if err := activateAppVersion(appsDir, versionsDir, target, tmp); err != nil {
+	activation, err := activateAppVersion(appsDir, versionsDir, target, tmp, in.Manifest.Name, approvalBackup)
+	if err != nil {
+		_ = migrations.Rollback()
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
+	if err := migrations.Commit(); err != nil {
+		rollbackErr := activation.Rollback()
+		http.Error(w, "invalid migration: "+boundedError(errors.Join(err, rollbackErr)), http.StatusBadRequest)
+		return
+	}
+	activation.Commit()
 	audit(r, "publish_app", actor, site.Name, in.Manifest.Name)
 	respond(w, http.StatusCreated, map[string]string{
 		"site": site.Name,
@@ -268,32 +290,162 @@ func syncDir(name string) error {
 	return dir.Sync()
 }
 
-func activateAppVersion(appsDir, versionsDir, target, staged string) error {
-	if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink == 0 {
-		return errors.New("existing app is not a version pointer")
-	} else if err != nil && !os.IsNotExist(err) {
+type fileRollback struct {
+	path    string
+	data    []byte
+	existed bool
+}
+
+func snapshotFile(name string) (fileRollback, error) {
+	backup := fileRollback{path: name}
+	data, err := os.ReadFile(name)
+	if os.IsNotExist(err) {
+		return backup, nil
+	}
+	if err != nil {
+		return backup, err
+	}
+	backup.data = data
+	backup.existed = true
+	return backup, nil
+}
+
+func (backup fileRollback) Remove() error {
+	if !backup.existed {
+		return nil
+	}
+	if err := os.Remove(backup.path); err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	return syncDir(filepath.Dir(backup.path))
+}
+
+func (backup fileRollback) Restore() error {
+	if !backup.existed {
+		if err := os.Remove(backup.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		directory := filepath.Dir(backup.path)
+		if _, err := os.Stat(directory); os.IsNotExist(err) {
+			return nil
+		}
+		return syncDir(directory)
+	}
+	return writeAtomicFile(backup.path, backup.data)
+}
+
+func writeAtomicFile(name string, data []byte) error {
+	directory := filepath.Dir(name)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(directory, ".atomic-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	writeErr := tmp.Chmod(0600)
+	if writeErr == nil {
+		_, writeErr = tmp.Write(data)
+	}
+	if writeErr == nil {
+		writeErr = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if err := os.Rename(tmp.Name(), name); err != nil {
+		return err
+	}
+	return syncDir(directory)
+}
+
+type appActivationJournal struct {
+	App              string `json:"app"`
+	OldVersion       string `json:"old_version,omitempty"`
+	NewVersion       string `json:"new_version"`
+	ApprovalExisted  bool   `json:"approval_existed"`
+	ApprovalContents []byte `json:"approval_contents,omitempty"`
+}
+
+type appActivation struct {
+	appsDir     string
+	versionsDir string
+	target      string
+	ready       string
+	oldVersion  string
+	journalPath string
+	approval    fileRollback
+}
+
+func activateAppVersion(appsDir, versionsDir, target, staged, appName string, approval fileRollback) (*appActivation, error) {
+	if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		return nil, errors.New("existing app is not a version pointer")
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
 	}
 	oldVersion, _ := filepath.EvalSymlinks(target)
+	if oldVersion != "" && !pathWithin(versionsDir, oldVersion) {
+		return nil, errors.New("existing app version escapes version directory")
+	}
 	ready := staged + ".ready"
+	journalDirectory := filepath.Join(filepath.Dir(appsDir), ".app-activations")
+	journalPath := filepath.Join(journalDirectory, appName+".json")
+	journal := appActivationJournal{
+		App:              appName,
+		NewVersion:       filepath.Base(ready),
+		ApprovalExisted:  approval.existed,
+		ApprovalContents: approval.data,
+	}
+	if oldVersion != "" {
+		journal.OldVersion = filepath.Base(oldVersion)
+	}
+	journalJSON, err := json.Marshal(journal)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeAtomicFile(journalPath, journalJSON); err != nil {
+		return nil, err
+	}
+	activation := &appActivation{
+		appsDir: appsDir, versionsDir: versionsDir, target: target, ready: ready,
+		oldVersion: oldVersion, journalPath: journalPath, approval: approval,
+	}
+	if err := approval.Remove(); err != nil {
+		return nil, errors.Join(err, activation.Rollback())
+	}
 	if err := os.Rename(staged, ready); err != nil {
-		return err
+		return nil, errors.Join(err, activation.Rollback())
 	}
 	if err := syncDir(versionsDir); err != nil {
-		return err
+		return nil, errors.Join(err, activation.Rollback())
 	}
+	if err := replaceAppPointer(appsDir, target, ready); err != nil {
+		return nil, errors.Join(err, activation.Rollback())
+	}
+	if err := syncDir(appsDir); err != nil {
+		return nil, errors.Join(err, activation.Rollback())
+	}
+	return activation, nil
+}
+
+func replaceAppPointer(appsDir, target, version string) error {
 	pointer, err := os.CreateTemp(appsDir, ".activate-")
 	if err != nil {
 		return err
 	}
 	pointerName := pointer.Name()
 	if err := pointer.Close(); err != nil {
+		_ = os.Remove(pointerName)
 		return err
 	}
 	if err := os.Remove(pointerName); err != nil {
 		return err
 	}
-	relative, err := filepath.Rel(appsDir, ready)
+	relative, err := filepath.Rel(appsDir, version)
 	if err != nil {
 		return err
 	}
@@ -304,14 +456,145 @@ func activateAppVersion(appsDir, versionsDir, target, staged string) error {
 		_ = os.Remove(pointerName)
 		return err
 	}
-	if err := syncDir(appsDir); err != nil {
+	return nil
+}
+
+func (activation *appActivation) Rollback() error {
+	var rollbackErr error
+	if activation.oldVersion != "" && pathWithin(activation.versionsDir, activation.oldVersion) {
+		rollbackErr = replaceAppPointer(activation.appsDir, activation.target, activation.oldVersion)
+		if rollbackErr == nil {
+			rollbackErr = syncDir(activation.appsDir)
+		}
+	} else {
+		if err := os.Remove(activation.target); err != nil && !os.IsNotExist(err) {
+			rollbackErr = err
+		} else {
+			rollbackErr = syncDir(activation.appsDir)
+		}
+	}
+	approvalErr := activation.approval.Restore()
+	if rollbackErr == nil {
+		_ = os.RemoveAll(activation.ready)
+		_ = syncDir(activation.versionsDir)
+	}
+	journalErr := os.Remove(activation.journalPath)
+	if os.IsNotExist(journalErr) {
+		journalErr = nil
+	}
+	if journalErr == nil {
+		_ = syncDir(filepath.Dir(activation.journalPath))
+	}
+	return errors.Join(rollbackErr, approvalErr, journalErr)
+}
+
+func (activation *appActivation) Commit() {
+	if activation.oldVersion != "" && pathWithin(activation.versionsDir, activation.oldVersion) && activation.oldVersion != activation.ready {
+		_ = os.RemoveAll(activation.oldVersion)
+		_ = syncDir(activation.versionsDir)
+	}
+	_ = os.Remove(activation.journalPath)
+	_ = syncDir(filepath.Dir(activation.journalPath))
+}
+
+func (s *Server) reconcileAppActivation(ctx context.Context, site Site, appName string, store *siteDatabase) error {
+	journalDirectory := filepath.Join(s.cfg.Dir, site.Name, ".app-activations")
+	journalPath := filepath.Join(journalDirectory, appName+".json")
+	data, err := os.ReadFile(journalPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	if oldVersion != "" && pathWithin(versionsDir, oldVersion) && oldVersion != ready {
-		_ = os.RemoveAll(oldVersion)
-		_ = syncDir(versionsDir)
+	var journal appActivationJournal
+	if json.Unmarshal(data, &journal) != nil || journal.App != appName || !validAppVersionID(journal.NewVersion) || (journal.OldVersion != "" && !validAppVersionID(journal.OldVersion)) {
+		return errors.New("invalid app activation journal")
 	}
-	return nil
+	if err := store.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer store.writeMu.Unlock()
+	committedVersion := ""
+	var versionTableExists int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_botpages_app_versions'").Scan(&versionTableExists); err != nil {
+		return err
+	}
+	if versionTableExists != 0 {
+		err := store.db.QueryRowContext(ctx, "SELECT version_id FROM _botpages_app_versions WHERE app_name = ?", appName).Scan(&committedVersion)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	appsDir := filepath.Join(s.cfg.Dir, site.Name, ".apps")
+	versionsDir := filepath.Join(s.cfg.Dir, site.Name, ".app-versions", appName)
+	target := filepath.Join(appsDir, appName)
+	newVersion := filepath.Join(versionsDir, journal.NewVersion)
+	approval := fileRollback{
+		path: filepath.Join(s.cfg.Dir, site.Name, ".app-approvals", appName+".json"),
+		data: journal.ApprovalContents, existed: journal.ApprovalExisted,
+	}
+	if committedVersion == journal.NewVersion {
+		if info, err := os.Stat(newVersion); err != nil || !info.IsDir() {
+			return errors.New("committed app version is missing")
+		}
+		if err := replaceAppPointer(appsDir, target, newVersion); err != nil {
+			return err
+		}
+		if err := syncDir(appsDir); err != nil {
+			return err
+		}
+		if err := os.Remove(approval.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if _, err := os.Stat(filepath.Dir(approval.path)); err == nil {
+			if err := syncDir(filepath.Dir(approval.path)); err != nil {
+				return err
+			}
+		}
+		if journal.OldVersion != "" {
+			if err := os.RemoveAll(filepath.Join(versionsDir, journal.OldVersion)); err != nil {
+				return err
+			}
+		}
+	} else {
+		if journal.OldVersion != "" {
+			oldVersion := filepath.Join(versionsDir, journal.OldVersion)
+			if info, err := os.Stat(oldVersion); err != nil || !info.IsDir() {
+				return errors.New("previous app version is missing")
+			}
+			if err := replaceAppPointer(appsDir, target, oldVersion); err != nil {
+				return err
+			}
+			if err := syncDir(appsDir); err != nil {
+				return err
+			}
+		} else {
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := syncDir(appsDir); err != nil {
+				return err
+			}
+		}
+		if err := approval.Restore(); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(newVersion); err != nil {
+			return err
+		}
+	}
+	if err := syncDir(versionsDir); err != nil {
+		return err
+	}
+	if err := os.Remove(journalPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDir(journalDirectory)
+}
+
+func validAppVersionID(version string) bool {
+	return filepath.Base(version) == version && strings.HasPrefix(version, ".publish-") && strings.HasSuffix(version, ".ready")
 }
 
 func (s *Server) withinAppQuota(siteName, target, staged string, incoming int64) bool {
@@ -375,6 +658,12 @@ func (s *Server) approveAppNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	storageLock := s.siteStorageLock(approval.Site)
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	site, err := s.site(approval.Site)
 	if err != nil {
 		http.NotFound(w, r)
@@ -410,6 +699,11 @@ func (s *Server) approveAppNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data, _ := json.Marshal(approval.Domains)
+	target := filepath.Join(dir, approval.App+".json")
+	if !s.withinQuota(site.Name, target, int64(len(data))) {
+		http.Error(w, "site quota exceeded", http.StatusRequestEntityTooLarge)
+		return
+	}
 	tmp, err := os.CreateTemp(dir, ".approval-")
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
@@ -427,7 +721,7 @@ func (s *Server) approveAppNetwork(w http.ResponseWriter, r *http.Request) {
 		writeErr = closeErr
 	}
 	if writeErr == nil {
-		writeErr = os.Rename(tmp.Name(), filepath.Join(dir, approval.App+".json"))
+		writeErr = os.Rename(tmp.Name(), target)
 	}
 	if writeErr == nil {
 		writeErr = syncDir(dir)
@@ -547,6 +841,18 @@ func (s *Server) loadApp(slug, name string) (loadedApp, error) {
 		site, err := s.site(entry.Name())
 		if err != nil || site.Slug != slug {
 			continue
+		}
+		storageLock := s.siteStorageLock(site.Name)
+		if err := storageLock.LockContext(context.Background()); err != nil {
+			return loadedApp{}, err
+		}
+		store, databaseErr := s.ensureSiteDatabase(site.Name)
+		if databaseErr == nil {
+			databaseErr = s.reconcileAppActivation(context.Background(), site, name, store)
+		}
+		storageLock.Unlock()
+		if databaseErr != nil {
+			return loadedApp{}, databaseErr
 		}
 		root := filepath.Join(s.cfg.Dir, site.Name, ".apps", name)
 		manifestBytes, err := os.ReadFile(filepath.Join(root, "manifest.json"))

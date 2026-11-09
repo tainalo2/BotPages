@@ -9,17 +9,48 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/dop251/goja"
 	_ "modernc.org/sqlite"
 )
 
 const siteDatabaseFilename = "data.sqlite"
+const siteDatabaseWALReserve int64 = 16 << 20
+const siteDatabaseMetadataReserve int64 = 256 << 10
+const sqliteWALFrameHeaderBytes int64 = 24
+const siteDatabaseAutoCheckpointPages = 256
+
+var errSiteDatabaseQuota = errors.New("site database quota exhausted")
 
 type siteDatabase struct {
 	db      *sql.DB
-	writeMu sync.Mutex
+	readDB  *sql.DB
+	writeMu *contextMutex
+}
+
+type contextMutex struct {
+	slot chan struct{}
+}
+
+func newContextMutex() *contextMutex {
+	return &contextMutex{slot: make(chan struct{}, 1)}
+}
+
+func (mutex *contextMutex) Lock() {
+	mutex.slot <- struct{}{}
+}
+
+func (mutex *contextMutex) LockContext(ctx context.Context) error {
+	select {
+	case mutex.slot <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (mutex *contextMutex) Unlock() {
+	<-mutex.slot
 }
 
 func (s *Server) ensureSiteDatabase(siteName string) (*siteDatabase, error) {
@@ -37,12 +68,16 @@ func (s *Server) ensureSiteDatabase(siteName string) (*siteDatabase, error) {
 	if err := os.MkdirAll(filepath.Dir(databasePath), 0700); err != nil {
 		return nil, err
 	}
-	dsn := (&url.URL{Scheme: "file", Path: databasePath}).String() + "?_pragma=busy_timeout%285000%29&_pragma=foreign_keys%281%29"
+	dsn := fmt.Sprintf(
+		"%s?_pragma=busy_timeout%%285000%%29&_pragma=foreign_keys%%281%%29&_pragma=wal_autocheckpoint%%28%d%%29&_pragma=journal_size_limit%%28%d%%29",
+		(&url.URL{Scheme: "file", Path: databasePath}).String(), siteDatabaseAutoCheckpointPages, siteDatabaseWALReserve,
+	)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(8)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	var journalMode string
 	if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
 		_ = db.Close()
@@ -57,9 +92,101 @@ func (s *Server) ensureSiteDatabase(siteName string) (*siteDatabase, error) {
 		return nil, err
 	}
 
-	store := &siteDatabase{db: db}
+	readDB, err := sql.Open("sqlite", dsn+"&_pragma=query_only%281%29")
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	readDB.SetMaxOpenConns(8)
+	if err := readDB.PingContext(context.Background()); err != nil {
+		_ = readDB.Close()
+		_ = db.Close()
+		return nil, err
+	}
+	store := &siteDatabase{db: db, readDB: readDB, writeMu: newContextMutex()}
+	if err := s.configureSiteDatabaseQuota(context.Background(), siteName, store); err != nil {
+		_ = readDB.Close()
+		_ = db.Close()
+		return nil, err
+	}
 	s.siteDatabases[siteName] = store
 	return store, nil
+}
+
+func (s *Server) configureSiteDatabaseQuota(ctx context.Context, siteName string, store *siteDatabase) error {
+	root := filepath.Join(s.cfg.Dir, siteName)
+	databasePath := filepath.Join(root, siteDatabaseFilename)
+	excluded := map[string]bool{
+		databasePath:          true,
+		databasePath + "-wal": true,
+		databasePath + "-shm": true,
+	}
+	var otherBytes int64
+	err := filepath.Walk(root, func(current string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() && !excluded[current] {
+			otherBytes += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	available := maxSiteBytes - siteDatabaseWALReserve - siteDatabaseMetadataReserve - otherBytes
+	if available <= 0 {
+		return errSiteDatabaseQuota
+	}
+	var pageSize, pageCount int64
+	if err := store.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return fmt.Errorf("read database page size: %w", err)
+	}
+	if err := store.db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return fmt.Errorf("read database page count: %w", err)
+	}
+	// One transaction can temporarily duplicate every database page in the WAL.
+	// Include the per-frame WAL header rather than assuming each frame is only
+	// one SQLite page.
+	maxPages := available / (2*pageSize + sqliteWALFrameHeaderBytes)
+	if maxPages < pageCount || maxPages < 1 {
+		return errSiteDatabaseQuota
+	}
+	var appliedMaxPages int64
+	pragma := fmt.Sprintf("PRAGMA max_page_count = %d", maxPages)
+	if err := store.db.QueryRowContext(ctx, pragma).Scan(&appliedMaxPages); err != nil {
+		return fmt.Errorf("set database page limit: %w", err)
+	}
+	if appliedMaxPages > maxPages {
+		return fmt.Errorf("%w: SQLite page limit could not be reduced", errSiteDatabaseQuota)
+	}
+	return nil
+}
+
+func (s *Server) prepareSiteDatabaseWrite(ctx context.Context, siteName string, store *siteDatabase) error {
+	busy, err := checkpointSiteDatabase(ctx, store)
+	if err != nil {
+		return err
+	}
+	walPath := filepath.Join(s.cfg.Dir, siteName, siteDatabaseFilename) + "-wal"
+	walBytes := int64(0)
+	if info, statErr := os.Stat(walPath); statErr == nil {
+		walBytes = info.Size()
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	if busy && walBytes >= siteDatabaseWALReserve {
+		return fmt.Errorf("%w: WAL checkpoint is blocked", errSiteDatabaseQuota)
+	}
+	return s.configureSiteDatabaseQuota(ctx, siteName, store)
+}
+
+func checkpointSiteDatabase(ctx context.Context, store *siteDatabase) (bool, error) {
+	var busy, logFrames, checkpointedFrames int
+	if err := store.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointedFrames); err != nil {
+		return false, fmt.Errorf("checkpoint site database: %w", err)
+	}
+	return busy != 0, nil
 }
 
 func (s *Server) closeSiteDatabases() error {
@@ -67,14 +194,19 @@ func (s *Server) closeSiteDatabases() error {
 	defer s.siteDatabasesMu.Unlock()
 	var closeErr error
 	for siteName, store := range s.siteDatabases {
-		closeErr = errors.Join(closeErr, store.db.Close())
+		closeErr = errors.Join(closeErr, store.readDB.Close(), store.db.Close())
 		delete(s.siteDatabases, siteName)
 	}
 	return closeErr
 }
 
 func (s *Server) bindSiteDatabase(ctx context.Context, vm *goja.Runtime, siteName string) error {
+	storageLock := s.siteStorageLock(siteName)
+	if err := storageLock.LockContext(ctx); err != nil {
+		return err
+	}
 	store, err := s.ensureSiteDatabase(siteName)
+	storageLock.Unlock()
 	if err != nil {
 		return err
 	}
@@ -88,9 +220,23 @@ func (s *Server) bindSiteDatabase(ctx context.Context, vm *goja.Runtime, siteNam
 		if err != nil {
 			panic(vm.NewGoError(err))
 		}
-		store.writeMu.Lock()
+		storageLock := s.siteStorageLock(siteName)
+		if err := storageLock.LockContext(ctx); err != nil {
+			panic(vm.NewGoError(fmt.Errorf("database write canceled: %w", err)))
+		}
+		if err := store.writeMu.LockContext(ctx); err != nil {
+			storageLock.Unlock()
+			panic(vm.NewGoError(fmt.Errorf("database write canceled: %w", err)))
+		}
+		if err := s.prepareSiteDatabaseWrite(ctx, siteName, store); err != nil {
+			store.writeMu.Unlock()
+			storageLock.Unlock()
+			panic(vm.NewGoError(err))
+		}
 		result, err := store.db.ExecContext(ctx, query, arguments...)
+		_, _ = checkpointSiteDatabase(ctx, store)
 		store.writeMu.Unlock()
+		storageLock.Unlock()
 		if err != nil {
 			panic(vm.NewGoError(fmt.Errorf("database exec failed: %w", err)))
 		}
@@ -115,7 +261,7 @@ func (s *Server) bindSiteDatabase(ctx context.Context, vm *goja.Runtime, siteNam
 		if err != nil {
 			panic(vm.NewGoError(err))
 		}
-		rows, err := store.db.QueryContext(ctx, query, arguments...)
+		rows, err := store.readDB.QueryContext(ctx, query, arguments...)
 		if err != nil {
 			panic(vm.NewGoError(fmt.Errorf("database query failed: %w", err)))
 		}

@@ -54,7 +54,10 @@ func unsafeMigrationSQL(script string) bool {
 	if strings.Contains(upper, "_BOTPAGES_") {
 		return true
 	}
-	for _, keyword := range []string{"ATTACH", "DETACH", "VACUUM", "PRAGMA", "LOAD_EXTENSION"} {
+	for _, keyword := range []string{
+		"ATTACH", "DETACH", "VACUUM", "PRAGMA", "LOAD_EXTENSION",
+		"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE",
+	} {
 		if containsSQLKeyword(script, keyword) {
 			return true
 		}
@@ -135,22 +138,30 @@ func migrationFilesSize(migrations []AppMigration) int64 {
 	return size
 }
 
-func applyMigrations(ctx context.Context, store *siteDatabase, appName string, migrations []AppMigration) (err error) {
-	if len(migrations) == 0 {
-		return nil
-	}
-	store.writeMu.Lock()
-	defer store.writeMu.Unlock()
+type migrationRun struct {
+	store *siteDatabase
+	tx    *sql.Tx
+	ctx   context.Context
+}
 
+func prepareMigrations(ctx context.Context, server *Server, store *siteDatabase, siteName, appName, versionID string, migrations []AppMigration) (*migrationRun, error) {
+	if err := store.writeMu.LockContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := server.prepareSiteDatabaseWrite(ctx, siteName, store); err != nil {
+		store.writeMu.Unlock()
+		return nil, err
+	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		store.writeMu.Unlock()
+		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	run := &migrationRun{store: store, tx: tx, ctx: ctx}
+	fail := func(err error) (*migrationRun, error) {
+		_ = run.Rollback()
+		return nil, err
+	}
 	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _botpages_migrations (
 		app_name TEXT NOT NULL,
 		migration_name TEXT NOT NULL,
@@ -158,7 +169,14 @@ func applyMigrations(ctx context.Context, store *siteDatabase, appName string, m
 		applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (app_name, migration_name)
 	)`); err != nil {
-		return fmt.Errorf("create migration history: %w", err)
+		return fail(fmt.Errorf("create migration history: %w", err))
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _botpages_app_versions (
+		app_name TEXT PRIMARY KEY,
+		version_id TEXT NOT NULL,
+		published_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fail(fmt.Errorf("create app version history: %w", err))
 	}
 	for _, migration := range migrations {
 		digest := sha256.Sum256([]byte(migration.SQL))
@@ -172,22 +190,48 @@ func applyMigrations(ctx context.Context, store *siteDatabase, appName string, m
 		case err == nil && appliedChecksum == checksum:
 			continue
 		case err == nil:
-			return fmt.Errorf("migration %s changed after it was applied", migration.Name)
+			return fail(fmt.Errorf("migration %s changed after it was applied", migration.Name))
 		case !errors.Is(err, sql.ErrNoRows):
-			return fmt.Errorf("read migration history: %w", err)
+			return fail(fmt.Errorf("read migration history: %w", err))
 		}
 		if _, err = tx.ExecContext(ctx, migration.SQL); err != nil {
-			return fmt.Errorf("migration %s: %w", migration.Name, err)
+			return fail(fmt.Errorf("migration %s: %w", migration.Name, err))
 		}
 		if _, err = tx.ExecContext(ctx,
 			"INSERT INTO _botpages_migrations(app_name, migration_name, checksum) VALUES (?, ?, ?)",
 			appName, migration.Name, checksum,
 		); err != nil {
-			return fmt.Errorf("record migration %s: %w", migration.Name, err)
+			return fail(fmt.Errorf("record migration %s: %w", migration.Name, err))
 		}
 	}
-	if err = tx.Commit(); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO _botpages_app_versions(app_name, version_id)
+		VALUES (?, ?)
+		ON CONFLICT(app_name) DO UPDATE SET version_id = excluded.version_id, published_at = CURRENT_TIMESTAMP`, appName, versionID); err != nil {
+		return fail(fmt.Errorf("record app version: %w", err))
+	}
+	return run, nil
+}
+
+func (run *migrationRun) Commit() error {
+	if run.tx == nil {
+		return nil
+	}
+	err := run.tx.Commit()
+	_, _ = checkpointSiteDatabase(run.ctx, run.store)
+	run.store.writeMu.Unlock()
+	run.tx = nil
+	if err != nil {
 		return fmt.Errorf("commit migrations: %w", err)
 	}
 	return nil
+}
+
+func (run *migrationRun) Rollback() error {
+	if run.tx == nil {
+		return nil
+	}
+	err := run.tx.Rollback()
+	run.store.writeMu.Unlock()
+	run.tx = nil
+	return err
 }
