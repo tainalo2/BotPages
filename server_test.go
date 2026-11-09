@@ -17,6 +17,7 @@ func setup(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 func call(s *Server, method, path, auth string, body []byte) *httptest.ResponseRecorder {

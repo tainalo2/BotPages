@@ -108,6 +108,7 @@ func TestFixedHostSandboxAndScopedPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	r := httptest.NewRequest("POST", "/api/publish", strings.NewReader(`{"site":"newser","path":"index.html","content":"<script>window.ok=1</script>","visibility":"unlisted"}`))
 	r.Host = "botpages.example.test"
 	r.Header.Set("Authorization", "Bearer bot-secret")
