@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	defaultAppTimeoutMS = 5000
-	maxAppTimeoutMS     = 10000
-	defaultAppMemoryMB  = 32
-	maxAppMemoryMB      = 64
+	defaultAppTimeoutMS     = 5000
+	maxAppTimeoutMS         = 10000
+	defaultAppMemoryMB      = 32
+	maxAppMemoryMB          = 64
+	appMemorySampleInterval = time.Millisecond
 )
 
 type AppRoute struct {
@@ -499,13 +500,11 @@ func (s *Server) serveApp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
-	select {
-	case s.appSlots <- struct{}{}:
-		defer func() { <-s.appSlots }()
-	default:
+	if !s.acquireAppSlot(app.site.Name) {
 		http.Error(w, "app runtime capacity exhausted", http.StatusServiceUnavailable)
 		return
 	}
+	defer s.releaseAppSlot(app.site.Name)
 	response, halt, err := s.executeApp(app, r, routePath, string(body))
 	if halt == "timeout" {
 		http.Error(w, "app execution timed out", http.StatusGatewayTimeout)
@@ -625,17 +624,17 @@ func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body stri
 	}
 	stop := make(chan struct{})
 	var watchers sync.WaitGroup
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	baseline := stats.HeapAlloc
+	limit := uint64(app.manifest.MemoryMB) << 20
 	watchers.Add(1)
 	go func() {
 		defer watchers.Done()
 		timer := time.NewTimer(app.manifest.timeout())
 		defer timer.Stop()
-		ticker := time.NewTicker(10 * time.Millisecond)
+		ticker := time.NewTicker(appMemorySampleInterval)
 		defer ticker.Stop()
-		var stats runtime.MemStats
-		runtime.ReadMemStats(&stats)
-		baseline := stats.HeapAlloc
-		limit := uint64(app.manifest.MemoryMB) << 20
 		for {
 			select {
 			case <-stop:

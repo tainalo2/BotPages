@@ -76,10 +76,11 @@ func TestGojaDatabaseAPIIsPersistentAndRejectsCrossSiteAccess(t *testing.T) {
 
 func TestGojaDatabaseWritesAreSafeUnderConcurrency(t *testing.T) {
 	s, err := NewServer(Config{
-		Dir:               t.TempDir(),
-		AdminToken:        "admin-secret",
-		Bots:              map[string]string{"newser": "bot-secret"},
-		MaxConcurrentApps: 32,
+		Dir:                      t.TempDir(),
+		AdminToken:               "admin-secret",
+		Bots:                     map[string]string{"newser": "bot-secret"},
+		MaxConcurrentApps:        32,
+		MaxConcurrentAppsPerSite: 24,
 	})
 	if err != nil {
 		t.Fatal(err)

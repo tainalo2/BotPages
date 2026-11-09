@@ -121,10 +121,65 @@ func TestAppExecutionConcurrencyIsBounded(t *testing.T) {
 	<-done
 }
 
+func TestAppExecutionConcurrencyReservesCapacityAcrossSites(t *testing.T) {
+	s, err := NewServer(Config{
+		Dir:               t.TempDir(),
+		AdminToken:        "admin-secret",
+		Bots:              map[string]string{"alpha": "alpha-secret", "beta": "beta-secret"},
+		MaxConcurrentApps: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	alpha := publishTestAppForSite(t, s, "alpha", "alpha-secret", AppManifest{Name: "slow", TimeoutMS: 250, Routes: []AppRoute{{Method: "GET", Path: "/run"}}}, `function handle(){ while (true) {} }`)
+	beta := publishTestAppForSite(t, s, "beta", "beta-secret", AppManifest{Name: "fast", TimeoutMS: 250, Routes: []AppRoute{{Method: "GET", Path: "/run"}}}, `function handle(){ return {body: "beta-ok"}; }`)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		call(s, http.MethodGet, alpha+"/run", "", nil)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	secondAlpha := call(s, http.MethodGet, alpha+"/run", "", nil)
+	if secondAlpha.Code != http.StatusServiceUnavailable || !strings.Contains(secondAlpha.Body.String(), "capacity") {
+		t.Fatalf("site monopolized global slots: %d %q", secondAlpha.Code, secondAlpha.Body.String())
+	}
+	betaResponse := call(s, http.MethodGet, beta+"/run", "", nil)
+	if betaResponse.Code != http.StatusOK || betaResponse.Body.String() != "beta-ok" {
+		t.Fatalf("other site could not use reserved capacity: %d %q", betaResponse.Code, betaResponse.Body.String())
+	}
+	<-done
+}
+
+func TestAppExecutionRejectsPerSiteLimitThatCanMonopolizeGlobalSlots(t *testing.T) {
+	s, err := NewServer(Config{
+		Dir:                      t.TempDir(),
+		AdminToken:               "admin-secret",
+		MaxConcurrentApps:        4,
+		MaxConcurrentAppsPerSite: 4,
+	})
+	if err == nil {
+		_ = s.Close()
+		t.Fatal("accepted a per-site limit that can consume every global slot")
+	}
+}
+
+func TestAppMemoryWatchdogUsesFrequentSampling(t *testing.T) {
+	if appMemorySampleInterval != time.Millisecond {
+		t.Fatalf("memory sample interval = %s, want %s", appMemorySampleInterval, time.Millisecond)
+	}
+}
+
 func publishTestApp(t *testing.T, s *Server, manifest AppManifest, entry string) string {
 	t.Helper()
-	body, _ := json.Marshal(appPublication{Site: "newser", Manifest: manifest, Entry: entry})
-	w := call(s, http.MethodPost, "/api/apps", "bot-secret", body)
+	return publishTestAppForSite(t, s, "newser", "bot-secret", manifest, entry)
+}
+
+func publishTestAppForSite(t *testing.T, s *Server, site, token string, manifest AppManifest, entry string) string {
+	t.Helper()
+	body, _ := json.Marshal(appPublication{Site: site, Manifest: manifest, Entry: entry})
+	w := call(s, http.MethodPost, "/api/apps", token, body)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("publish: %d %s", w.Code, w.Body.String())
 	}

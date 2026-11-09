@@ -21,16 +21,17 @@ import (
 )
 
 type Config struct {
-	Dir               string
-	AdminToken        string
-	Bots              map[string]string
-	Publishers        map[string]string // jetons partagés : publient sur tout site non répertorié
-	Readers           map[string]map[string]string
-	AdminDir          string
-	AdminHost         string
-	ContentHost       string
-	AppHTTPClient     *http.Client
-	MaxConcurrentApps int
+	Dir                      string
+	AdminToken               string
+	Bots                     map[string]string
+	Publishers               map[string]string // jetons partagés : publient sur tout site non répertorié
+	Readers                  map[string]map[string]string
+	AdminDir                 string
+	AdminHost                string
+	ContentHost              string
+	AppHTTPClient            *http.Client
+	MaxConcurrentApps        int
+	MaxConcurrentAppsPerSite int
 }
 type Site struct {
 	Name       string `json:"name"`
@@ -44,6 +45,9 @@ type Server struct {
 	limits          map[string]rateWindow
 	appClient       *http.Client
 	appSlots        chan struct{}
+	appSlotsMu      sync.Mutex
+	appSlotsBySite  map[string]chan struct{}
+	appSlotsPerSite int
 	siteDatabasesMu sync.Mutex
 	siteDatabases   map[string]*siteDatabase
 }
@@ -87,14 +91,59 @@ func NewServer(c Config) (*Server, error) {
 		_ = identities.close()
 		return nil, errors.New("MaxConcurrentApps must be between 1 and 64")
 	}
+	maxConcurrentAppsPerSite := c.MaxConcurrentAppsPerSite
+	if maxConcurrentAppsPerSite == 0 {
+		maxConcurrentAppsPerSite = maxConcurrentApps / 2
+		if maxConcurrentAppsPerSite == 0 {
+			maxConcurrentAppsPerSite = 1
+		}
+	}
+	if maxConcurrentAppsPerSite < 1 || maxConcurrentAppsPerSite > maxConcurrentApps || (maxConcurrentApps > 1 && maxConcurrentAppsPerSite == maxConcurrentApps) {
+		_ = identities.close()
+		return nil, errors.New("MaxConcurrentAppsPerSite must be at least 1 and leave global capacity for another site")
+	}
 	return &Server{
-		cfg:           c,
-		identities:    identities,
-		limits:        make(map[string]rateWindow),
-		appClient:     client,
-		appSlots:      make(chan struct{}, maxConcurrentApps),
-		siteDatabases: make(map[string]*siteDatabase),
+		cfg:             c,
+		identities:      identities,
+		limits:          make(map[string]rateWindow),
+		appClient:       client,
+		appSlots:        make(chan struct{}, maxConcurrentApps),
+		appSlotsBySite:  make(map[string]chan struct{}),
+		appSlotsPerSite: maxConcurrentAppsPerSite,
+		siteDatabases:   make(map[string]*siteDatabase),
 	}, nil
+}
+
+func (s *Server) appSlotForSite(siteName string) chan struct{} {
+	s.appSlotsMu.Lock()
+	defer s.appSlotsMu.Unlock()
+	slot := s.appSlotsBySite[siteName]
+	if slot == nil {
+		slot = make(chan struct{}, s.appSlotsPerSite)
+		s.appSlotsBySite[siteName] = slot
+	}
+	return slot
+}
+
+func (s *Server) acquireAppSlot(siteName string) bool {
+	siteSlot := s.appSlotForSite(siteName)
+	select {
+	case siteSlot <- struct{}{}:
+	default:
+		return false
+	}
+	select {
+	case s.appSlots <- struct{}{}:
+		return true
+	default:
+		<-siteSlot
+		return false
+	}
+}
+
+func (s *Server) releaseAppSlot(siteName string) {
+	<-s.appSlots
+	<-s.appSlotForSite(siteName)
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
