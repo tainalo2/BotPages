@@ -8,6 +8,7 @@ FROM golang:1.24-alpine AS backend
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum *.go ./
+COPY web/ ./web/
 RUN go test ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /botpages .
 FROM alpine:3.21
 ARG VERSION=dev
