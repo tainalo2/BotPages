@@ -157,6 +157,10 @@ func (s *Server) issueSession(ctx context.Context, siteName string, userID int64
 		return "", err
 	}
 	tokenStr := hex.EncodeToString(token)
+	key, err := s.siteSigningKey(ctx, siteName)
+	if err != nil {
+		return "", err
+	}
 	store, err := s.ensureSiteDatabase(siteName)
 	if err != nil {
 		return "", err
@@ -168,10 +172,6 @@ func (s *Server) issueSession(ctx context.Context, siteName string, userID int64
 	defer store.writeMu.Unlock()
 	expires := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
 	if _, err := store.db.ExecContext(ctx, "INSERT INTO _botpages_sessions (token, user_id, expires_at) VALUES (?, ?, ?)", tokenStr, userID, expires); err != nil {
-		return "", err
-	}
-	key, err := s.siteSigningKey(ctx, siteName)
-	if err != nil {
 		return "", err
 	}
 	mac := hmac.New(sha256.New, key)
