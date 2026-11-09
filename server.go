@@ -703,6 +703,119 @@ func (s *Server) servePage(w http.ResponseWriter, r *http.Request) {
 	}
 	http.NotFound(w, r)
 }
+func (s *Server) siteBySlug(slug string) (string, Site, bool) {
+	entries, err := os.ReadDir(s.cfg.Dir)
+	if err != nil {
+		return "", Site{}, false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		site, err := s.site(e.Name())
+		if err != nil || site.Slug != slug {
+			continue
+		}
+		return e.Name(), site, true
+	}
+	return "", Site{}, false
+}
+
+func (s *Server) handleUserAuth(w http.ResponseWriter, r *http.Request, slug, action string) {
+	siteName, site, ok := s.siteBySlug(slug)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	switch action {
+	case "register":
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		var in struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if in.Username == "" || in.Password == "" {
+			http.Error(w, "username and password required", http.StatusBadRequest)
+			return
+		}
+		u, err := s.createSiteUser(r.Context(), siteName, in.Username, in.Password)
+		if err != nil {
+			http.Error(w, "could not create user", http.StatusConflict)
+			return
+		}
+		token, err := s.issueSession(r.Context(), siteName, u.ID)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		setSessionCookie(w, site.Slug, token)
+		respond(w, http.StatusCreated, u)
+	case "login":
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		var in struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		u, ok, err := s.authenticateSiteUser(r.Context(), siteName, in.Username, in.Password)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		token, err := s.issueSession(r.Context(), siteName, u.ID)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		setSessionCookie(w, site.Slug, token)
+		respond(w, http.StatusOK, u)
+	case "logout":
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "bp_session",
+			Value:    "",
+			Path:     "/p/" + slug + "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func setSessionCookie(w http.ResponseWriter, slug, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "bp_session",
+		Value:    token,
+		Path:     "/p/" + slug + "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/health" && r.Method == "GET" {
 		respond(w, 200, map[string]string{"status": "ok", "version": version})
@@ -763,6 +876,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mcp(w, r)
 	case strings.HasPrefix(r.URL.Path, "/a/"):
 		s.serveApp(w, r)
+	case strings.HasPrefix(r.URL.Path, "/p/") && (strings.HasSuffix(r.URL.Path, "/register") || strings.HasSuffix(r.URL.Path, "/login") || strings.HasSuffix(r.URL.Path, "/logout")):
+		rest := strings.TrimPrefix(r.URL.Path, "/p/")
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) == 2 {
+			slug := parts[0]
+			action := strings.TrimPrefix(parts[1], "/")
+			// parts[1] like register
+			s.handleUserAuth(w, r, slug, action)
+			return
+		}
+		http.NotFound(w, r)
 	case strings.HasPrefix(r.URL.Path, "/p/") && (r.Method == "GET" || r.Method == "HEAD"):
 		s.servePage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/") && r.Method == "GET" && s.cfg.AdminDir != "":
