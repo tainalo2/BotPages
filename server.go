@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,7 @@ type Site struct {
 }
 type Server struct {
 	cfg    Config
+	db     *sql.DB
 	mu     sync.Mutex
 	limits map[string]rateWindow
 }
@@ -54,18 +56,17 @@ func NewServer(c Config) (*Server, error) {
 	if c.Dir == "" || c.AdminToken == "" {
 		return nil, errors.New("data directory and admin token required")
 	}
-	for _, token := range c.Publishers {
-		if token == "" || equal(token, c.AdminToken) {
-			return nil, errors.New("publisher tokens must be non-empty and differ from the admin token")
-		}
-	}
 	if (c.AdminHost == "") != (c.ContentHost == "") || (c.AdminHost != "" && strings.ContainsAny(c.AdminHost+c.ContentHost, "/:*")) {
 		return nil, errors.New("distinct admin and content hosts must be configured together")
 	}
 	if err := os.MkdirAll(c.Dir, 0700); err != nil {
 		return nil, err
 	}
-	return &Server{cfg: c, limits: make(map[string]rateWindow)}, nil
+	db, err := openIdentityDB(c.Dir, c.Bots, c.Publishers, c.AdminToken)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{cfg: c, db: db, limits: make(map[string]rateWindow)}, nil
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
@@ -73,17 +74,7 @@ func (s *Server) actor(r *http.Request) (string, bool) {
 	if h != "" && equal(h, s.cfg.AdminToken) {
 		return "admin", true
 	}
-	for name, token := range s.cfg.Bots {
-		if token != "" && equal(h, token) {
-			return name, false
-		}
-	}
-	for name, token := range s.cfg.Publishers {
-		if token != "" && h != "" && equal(h, token) {
-			return "publisher/" + name, false // « / » ne peut jamais égaler un nom de site
-		}
-	}
-	return "", false
+	return s.identityForToken(h)
 }
 
 // isPublisher : jeton partagé des bots, limité aux sites non répertoriés.
@@ -550,6 +541,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.publish(w, r, a, admin)
 	case r.URL.Path == "/api/sites" && r.Method == "GET":
 		s.list(w, r)
+	case r.URL.Path == "/api/admin/tokens" && r.Method == "GET":
+		s.listTokens(w, r)
+	case r.URL.Path == "/api/admin/tokens" && r.Method == "POST":
+		s.createToken(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/admin/tokens/") && r.Method == "DELETE":
+		s.revokeToken(w, r)
 	case r.URL.Path == "/api/rollback" && r.Method == "POST":
 		s.rollback(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/assets/") && r.Method == "PUT":
