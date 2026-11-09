@@ -356,6 +356,10 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 		http.Error(w, "visibility cannot change with publication", 403)
 		return
 	}
+	if err := EnsureSiteDB(s.cfg.Dir, in.Site); err != nil {
+		http.Error(w, "server error", 500)
+		return
+	}
 	target := filepath.Join(s.cfg.Dir, in.Site, site.Slug, filepath.FromSlash(in.Path))
 	if err = os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 		http.Error(w, "server error", 500)
