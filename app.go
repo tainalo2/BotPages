@@ -37,12 +37,13 @@ type AppRoute struct {
 }
 
 type AppManifest struct {
-	Name             string     `json:"name"`
-	Permissions      []string   `json:"permissions,omitempty"`
-	NetworkAllowlist []string   `json:"network_allowlist,omitempty"`
-	Routes           []AppRoute `json:"routes"`
-	TimeoutMS        int        `json:"timeout_ms,omitempty"`
-	MemoryMB         int        `json:"memory_mb,omitempty"`
+	Name             string         `json:"name"`
+	Permissions      []string       `json:"permissions,omitempty"`
+	NetworkAllowlist []string       `json:"network_allowlist,omitempty"`
+	Routes           []AppRoute     `json:"routes"`
+	Migrations       []AppMigration `json:"migrations,omitempty"`
+	TimeoutMS        int            `json:"timeout_ms,omitempty"`
+	MemoryMB         int            `json:"memory_mb,omitempty"`
 }
 
 var domainPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$`)
@@ -105,6 +106,9 @@ func validateAppManifest(m *AppManifest) error {
 			return errors.New("duplicate route")
 		}
 		seenRoutes[key] = struct{}{}
+	}
+	if err := validateAppMigrations(m.Migrations); err != nil {
+		return err
 	}
 	seenPermissions := map[string]struct{}{}
 	for _, permission := range m.Permissions {
@@ -184,7 +188,8 @@ func (s *Server) publishApp(w http.ResponseWriter, r *http.Request, actor string
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	if _, err := s.ensureSiteDatabase(site.Name); err != nil {
+	store, err := s.ensureSiteDatabase(site.Name)
+	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
@@ -202,13 +207,17 @@ func (s *Server) publishApp(w http.ResponseWriter, r *http.Request, actor string
 	}
 	defer os.RemoveAll(tmp)
 	manifestJSON, err := json.Marshal(in.Manifest)
-	if err != nil || writeSyncedFile(filepath.Join(tmp, "manifest.json"), manifestJSON) != nil || writeSyncedFile(filepath.Join(tmp, "entry.js"), []byte(in.Entry)) != nil || syncDir(tmp) != nil {
+	if err != nil || writeSyncedFile(filepath.Join(tmp, "manifest.json"), manifestJSON) != nil || writeSyncedFile(filepath.Join(tmp, "entry.js"), []byte(in.Entry)) != nil || writeAppMigrationFiles(tmp, in.Manifest.Migrations) != nil || syncDir(tmp) != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
 	target := filepath.Join(appsDir, in.Manifest.Name)
-	if !s.withinAppQuota(site.Name, target, tmp, int64(len(manifestJSON)+len(in.Entry))) {
+	if !s.withinAppQuota(site.Name, target, tmp, int64(len(manifestJSON)+len(in.Entry))+migrationFilesSize(in.Manifest.Migrations)) {
 		http.Error(w, "site quota exceeded", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err := applyMigrations(r.Context(), store, in.Manifest.Name, in.Manifest.Migrations); err != nil {
+		http.Error(w, "invalid migration: "+boundedError(err), http.StatusBadRequest)
 		return
 	}
 	approvalPath := filepath.Join(s.cfg.Dir, site.Name, ".app-approvals", in.Manifest.Name+".json")

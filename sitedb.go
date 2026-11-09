@@ -170,6 +170,9 @@ func validateRuntimeSQL(query string, allowed ...string) error {
 	if query == "" || len(query) > 64<<10 {
 		return errors.New("database statement is empty or too large")
 	}
+	if strings.Contains(strings.ToUpper(query), "_BOTPAGES_") {
+		return errors.New("database internal tables are not accessible at runtime")
+	}
 	if hasSQLStatementSeparator(query) {
 		return errors.New("database statement must contain exactly one statement")
 	}
