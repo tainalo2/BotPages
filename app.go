@@ -601,6 +601,9 @@ func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body stri
 	}); err != nil {
 		return response, "", err
 	}
+	if err := s.bindSiteDatabase(executionContext, vm, app.site.Name); err != nil {
+		return response, "", err
+	}
 
 	var haltMu sync.Mutex
 	setHalt := func(reason string) {
