@@ -918,6 +918,16 @@ func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body stri
 	if err := s.bindSiteDatabase(executionContext, vm, app.site.Name); err != nil {
 		return response, "", err
 	}
+	// Bind current end-user identity (if any) for this request, without exposing secrets.
+	currentUser := interface{}(nil)
+	if cookie, err := r.Cookie("bp_session"); err == nil {
+		if u, ok, _ := s.validateSession(executionContext, app.site.Name, cookie.Value); ok {
+			currentUser = map[string]any{"id": u.ID, "username": u.Username}
+		}
+	}
+	if err := vm.Set("currentUser", currentUser); err != nil {
+		return response, "", err
+	}
 
 	var haltMu sync.Mutex
 	setHalt := func(reason string) {
