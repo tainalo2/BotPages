@@ -29,6 +29,8 @@ type Config struct {
 	AdminDir    string
 	AdminHost   string
 	ContentHost string
+	AppHTTPClient     *http.Client
+	MaxConcurrentApps int
 }
 type Site struct {
 	Name       string `json:"name"`
@@ -40,6 +42,8 @@ type Server struct {
 	identities *identityStore
 	mu         sync.Mutex
 	limits     map[string]rateWindow
+	appClient  *http.Client
+	appSlots   chan struct{}
 }
 type rateWindow struct {
 	start time.Time
@@ -69,7 +73,19 @@ func NewServer(c Config) (*Server, error) {
 	}
 	c.Bots = nil
 	c.Publishers = nil
-	return &Server{cfg: c, identities: identities, limits: make(map[string]rateWindow)}, nil
+	client := c.AppHTTPClient
+	if client == nil {
+		client = secureAppHTTPClient()
+	}
+	maxConcurrentApps := c.MaxConcurrentApps
+	if maxConcurrentApps == 0 {
+		maxConcurrentApps = 4
+	}
+	if maxConcurrentApps < 1 || maxConcurrentApps > 64 {
+		_ = identities.close()
+		return nil, errors.New("MaxConcurrentApps must be between 1 and 64")
+	}
+	return &Server{cfg: c, identities: identities, limits: make(map[string]rateWindow), appClient: client, appSlots: make(chan struct{}, maxConcurrentApps)}, nil
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
@@ -601,8 +617,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.AdminHost != "" && s.cfg.ContentHost != "" {
 		h := strings.ToLower(strings.Split(r.Host, ":")[0])
-		if strings.HasPrefix(r.URL.Path, "/p/") {
-			slug := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/p/"), "/", 2)[0]
+		if strings.HasPrefix(r.URL.Path, "/p/") || strings.HasPrefix(r.URL.Path, "/a/") {
+			prefix := "/p/"
+			if strings.HasPrefix(r.URL.Path, "/a/") {
+				prefix = "/a/"
+			}
+			slug := strings.SplitN(strings.TrimPrefix(r.URL.Path, prefix), "/", 2)[0]
 			if len(slug) != 36 || (s.cfg.AdminHost != s.cfg.ContentHost && h != slug+"."+s.cfg.ContentHost) || (s.cfg.AdminHost == s.cfg.ContentHost && h != s.cfg.AdminHost) {
 				http.NotFound(w, r)
 				return
@@ -623,6 +643,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/publish" && r.Method == "POST":
 		a, admin := s.actor(r)
 		s.publish(w, r, a, admin)
+	case r.URL.Path == "/api/apps" && r.Method == "POST":
+		a, admin := s.actor(r)
+		s.publishApp(w, r, a, admin)
 	case r.URL.Path == "/api/sites" && r.Method == "GET":
 		s.list(w, r)
 	case r.URL.Path == "/api/admin/bots" && r.Method == "GET":
@@ -639,10 +662,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.revokeIdentity(w, r, true)
 	case r.URL.Path == "/api/rollback" && r.Method == "POST":
 		s.rollback(w, r)
+	case r.URL.Path == "/api/admin/apps/network" && r.Method == "POST":
+		s.approveAppNetwork(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/assets/") && r.Method == "PUT":
 		s.uploadAsset(w, r)
 	case r.URL.Path == "/mcp" && r.Method == "POST":
 		s.mcp(w, r)
+	case strings.HasPrefix(r.URL.Path, "/a/"):
+		s.serveApp(w, r)
 	case strings.HasPrefix(r.URL.Path, "/p/") && (r.Method == "GET" || r.Method == "HEAD"):
 		s.servePage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/") && r.Method == "GET" && s.cfg.AdminDir != "":
