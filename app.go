@@ -184,6 +184,10 @@ func (s *Server) publishApp(w http.ResponseWriter, r *http.Request, actor string
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
+	if _, err := s.ensureSiteDatabase(site.Name); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
 
 	appsDir := filepath.Join(s.cfg.Dir, site.Name, ".apps")
 	versionsDir := filepath.Join(s.cfg.Dir, site.Name, ".app-versions", in.Manifest.Name)

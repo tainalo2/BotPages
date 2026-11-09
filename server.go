@@ -21,14 +21,14 @@ import (
 )
 
 type Config struct {
-	Dir         string
-	AdminToken  string
-	Bots        map[string]string
-	Publishers  map[string]string // jetons partagés : publient sur tout site non répertorié
-	Readers     map[string]map[string]string
-	AdminDir    string
-	AdminHost   string
-	ContentHost string
+	Dir               string
+	AdminToken        string
+	Bots              map[string]string
+	Publishers        map[string]string // jetons partagés : publient sur tout site non répertorié
+	Readers           map[string]map[string]string
+	AdminDir          string
+	AdminHost         string
+	ContentHost       string
 	AppHTTPClient     *http.Client
 	MaxConcurrentApps int
 }
@@ -38,12 +38,14 @@ type Site struct {
 	Visibility string `json:"visibility"`
 }
 type Server struct {
-	cfg        Config
-	identities *identityStore
-	mu         sync.Mutex
-	limits     map[string]rateWindow
-	appClient  *http.Client
-	appSlots   chan struct{}
+	cfg             Config
+	identities      *identityStore
+	mu              sync.Mutex
+	limits          map[string]rateWindow
+	appClient       *http.Client
+	appSlots        chan struct{}
+	siteDatabasesMu sync.Mutex
+	siteDatabases   map[string]*siteDatabase
 }
 type rateWindow struct {
 	start time.Time
@@ -85,7 +87,14 @@ func NewServer(c Config) (*Server, error) {
 		_ = identities.close()
 		return nil, errors.New("MaxConcurrentApps must be between 1 and 64")
 	}
-	return &Server{cfg: c, identities: identities, limits: make(map[string]rateWindow), appClient: client, appSlots: make(chan struct{}, maxConcurrentApps)}, nil
+	return &Server{
+		cfg:           c,
+		identities:    identities,
+		limits:        make(map[string]rateWindow),
+		appClient:     client,
+		appSlots:      make(chan struct{}, maxConcurrentApps),
+		siteDatabases: make(map[string]*siteDatabase),
+	}, nil
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
@@ -103,7 +112,9 @@ func (s *Server) actor(r *http.Request) (string, bool) {
 	return identity.SiteScope, false
 }
 
-func (s *Server) Close() error { return s.identities.close() }
+func (s *Server) Close() error {
+	return errors.Join(s.closeSiteDatabases(), s.identities.close())
+}
 
 // isPublisher : jeton partagé des bots, limité aux sites non répertoriés.
 func isPublisher(actor string) bool { return strings.HasPrefix(actor, "publisher/") }
