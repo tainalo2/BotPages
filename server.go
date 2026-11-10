@@ -21,14 +21,17 @@ import (
 )
 
 type Config struct {
-	Dir         string
-	AdminToken  string
-	Bots        map[string]string
-	Publishers  map[string]string // jetons partagés : publient sur tout site non répertorié
-	Readers     map[string]map[string]string
-	AdminDir    string
-	AdminHost   string
-	ContentHost string
+	Dir                      string
+	AdminToken               string
+	Bots                     map[string]string
+	Publishers               map[string]string // jetons partagés : publient sur tout site non répertorié
+	Readers                  map[string]map[string]string
+	AdminDir                 string
+	AdminHost                string
+	ContentHost              string
+	AppHTTPClient            *http.Client
+	MaxConcurrentApps        int
+	MaxConcurrentAppsPerSite int
 }
 type Site struct {
 	Name       string `json:"name"`
@@ -36,10 +39,19 @@ type Site struct {
 	Visibility string `json:"visibility"`
 }
 type Server struct {
-	cfg        Config
-	identities *identityStore
-	mu         sync.Mutex
-	limits     map[string]rateWindow
+	cfg             Config
+	identities      *identityStore
+	mu              sync.Mutex
+	limits          map[string]rateWindow
+	appClient       *http.Client
+	appSlots        chan struct{}
+	appSlotsMu      sync.Mutex
+	appSlotsBySite  map[string]chan struct{}
+	appSlotsPerSite int
+	storageLocksMu  sync.Mutex
+	storageLocks    map[string]*contextMutex
+	siteDatabasesMu sync.Mutex
+	siteDatabases   map[string]*siteDatabase
 }
 type rateWindow struct {
 	start time.Time
@@ -69,8 +81,85 @@ func NewServer(c Config) (*Server, error) {
 	}
 	c.Bots = nil
 	c.Publishers = nil
-	return &Server{cfg: c, identities: identities, limits: make(map[string]rateWindow)}, nil
+	client := c.AppHTTPClient
+	if client == nil {
+		client = secureAppHTTPClient()
+	}
+	maxConcurrentApps := c.MaxConcurrentApps
+	if maxConcurrentApps == 0 {
+		maxConcurrentApps = 4
+	}
+	if maxConcurrentApps < 1 || maxConcurrentApps > 64 {
+		_ = identities.close()
+		return nil, errors.New("MaxConcurrentApps must be between 1 and 64")
+	}
+	maxConcurrentAppsPerSite := c.MaxConcurrentAppsPerSite
+	if maxConcurrentAppsPerSite == 0 {
+		maxConcurrentAppsPerSite = maxConcurrentApps / 2
+		if maxConcurrentAppsPerSite == 0 {
+			maxConcurrentAppsPerSite = 1
+		}
+	}
+	if maxConcurrentAppsPerSite < 1 || maxConcurrentAppsPerSite > maxConcurrentApps || (maxConcurrentApps > 1 && maxConcurrentAppsPerSite == maxConcurrentApps) {
+		_ = identities.close()
+		return nil, errors.New("MaxConcurrentAppsPerSite must be at least 1 and leave global capacity for another site")
+	}
+	return &Server{
+		cfg:             c,
+		identities:      identities,
+		limits:          make(map[string]rateWindow),
+		appClient:       client,
+		appSlots:        make(chan struct{}, maxConcurrentApps),
+		appSlotsBySite:  make(map[string]chan struct{}),
+		appSlotsPerSite: maxConcurrentAppsPerSite,
+		storageLocks:    make(map[string]*contextMutex),
+		siteDatabases:   make(map[string]*siteDatabase),
+	}, nil
 }
+
+func (s *Server) appSlotForSite(siteName string) chan struct{} {
+	s.appSlotsMu.Lock()
+	defer s.appSlotsMu.Unlock()
+	slot := s.appSlotsBySite[siteName]
+	if slot == nil {
+		slot = make(chan struct{}, s.appSlotsPerSite)
+		s.appSlotsBySite[siteName] = slot
+	}
+	return slot
+}
+
+func (s *Server) acquireAppSlot(siteName string) bool {
+	siteSlot := s.appSlotForSite(siteName)
+	select {
+	case siteSlot <- struct{}{}:
+	default:
+		return false
+	}
+	select {
+	case s.appSlots <- struct{}{}:
+		return true
+	default:
+		<-siteSlot
+		return false
+	}
+}
+
+func (s *Server) releaseAppSlot(siteName string) {
+	<-s.appSlots
+	<-s.appSlotForSite(siteName)
+}
+
+func (s *Server) siteStorageLock(siteName string) *contextMutex {
+	s.storageLocksMu.Lock()
+	defer s.storageLocksMu.Unlock()
+	lock := s.storageLocks[siteName]
+	if lock == nil {
+		lock = newContextMutex()
+		s.storageLocks[siteName] = lock
+	}
+	return lock
+}
+
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 func (s *Server) actor(r *http.Request) (string, bool) {
 	h := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -87,7 +176,9 @@ func (s *Server) actor(r *http.Request) (string, bool) {
 	return identity.SiteScope, false
 }
 
-func (s *Server) Close() error { return s.identities.close() }
+func (s *Server) Close() error {
+	return errors.Join(s.closeSiteDatabases(), s.identities.close())
+}
 
 // isPublisher : jeton partagé des bots, limité aux sites non répertoriés.
 func isPublisher(actor string) bool { return strings.HasPrefix(actor, "publisher/") }
@@ -327,6 +418,12 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request, actor string, a
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	storageLock := s.siteStorageLock(in.Site)
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	site, err := s.site(in.Site)
 	if os.IsNotExist(err) {
 		if in.Visibility == "" {
@@ -435,6 +532,12 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	storageLock := s.siteStorageLock(in.Site)
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	site, err := s.site(in.Site)
 	if err != nil {
 		http.NotFound(w, r)
@@ -470,6 +573,12 @@ func (s *Server) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	storageLock := s.siteStorageLock(parts[0])
+	if err := storageLock.LockContext(r.Context()); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	defer storageLock.Unlock()
 	site, err := s.site(parts[0])
 	if err != nil {
 		http.NotFound(w, r)
@@ -594,6 +703,119 @@ func (s *Server) servePage(w http.ResponseWriter, r *http.Request) {
 	}
 	http.NotFound(w, r)
 }
+func (s *Server) siteBySlug(slug string) (string, Site, bool) {
+	entries, err := os.ReadDir(s.cfg.Dir)
+	if err != nil {
+		return "", Site{}, false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		site, err := s.site(e.Name())
+		if err != nil || site.Slug != slug {
+			continue
+		}
+		return e.Name(), site, true
+	}
+	return "", Site{}, false
+}
+
+func (s *Server) handleUserAuth(w http.ResponseWriter, r *http.Request, slug, action string) {
+	siteName, site, ok := s.siteBySlug(slug)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	switch action {
+	case "register":
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		var in struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if in.Username == "" || in.Password == "" {
+			http.Error(w, "username and password required", http.StatusBadRequest)
+			return
+		}
+		u, err := s.createSiteUser(r.Context(), siteName, in.Username, in.Password)
+		if err != nil {
+			http.Error(w, "could not create user", http.StatusConflict)
+			return
+		}
+		token, err := s.issueSession(r.Context(), siteName, u.ID)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		setSessionCookie(w, site.Slug, token)
+		respond(w, http.StatusCreated, u)
+	case "login":
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		var in struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		u, ok, err := s.authenticateSiteUser(r.Context(), siteName, in.Username, in.Password)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		token, err := s.issueSession(r.Context(), siteName, u.ID)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		setSessionCookie(w, site.Slug, token)
+		respond(w, http.StatusOK, u)
+	case "logout":
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "bp_session",
+			Value:    "",
+			Path:     "/p/" + slug + "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func setSessionCookie(w http.ResponseWriter, slug, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "bp_session",
+		Value:    token,
+		Path:     "/p/" + slug + "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/health" && r.Method == "GET" {
 		respond(w, 200, map[string]string{"status": "ok", "version": version})
@@ -601,8 +823,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.AdminHost != "" && s.cfg.ContentHost != "" {
 		h := strings.ToLower(strings.Split(r.Host, ":")[0])
-		if strings.HasPrefix(r.URL.Path, "/p/") {
-			slug := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/p/"), "/", 2)[0]
+		if strings.HasPrefix(r.URL.Path, "/p/") || strings.HasPrefix(r.URL.Path, "/a/") {
+			prefix := "/p/"
+			if strings.HasPrefix(r.URL.Path, "/a/") {
+				prefix = "/a/"
+			}
+			slug := strings.SplitN(strings.TrimPrefix(r.URL.Path, prefix), "/", 2)[0]
 			if len(slug) != 36 || (s.cfg.AdminHost != s.cfg.ContentHost && h != slug+"."+s.cfg.ContentHost) || (s.cfg.AdminHost == s.cfg.ContentHost && h != s.cfg.AdminHost) {
 				http.NotFound(w, r)
 				return
@@ -623,6 +849,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/publish" && r.Method == "POST":
 		a, admin := s.actor(r)
 		s.publish(w, r, a, admin)
+	case r.URL.Path == "/api/apps" && r.Method == "POST":
+		a, admin := s.actor(r)
+		s.publishApp(w, r, a, admin)
 	case r.URL.Path == "/api/sites" && r.Method == "GET":
 		s.list(w, r)
 	case r.URL.Path == "/api/admin/bots" && r.Method == "GET":
@@ -639,10 +868,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.revokeIdentity(w, r, true)
 	case r.URL.Path == "/api/rollback" && r.Method == "POST":
 		s.rollback(w, r)
+	case r.URL.Path == "/api/admin/apps/network" && r.Method == "POST":
+		s.approveAppNetwork(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/assets/") && r.Method == "PUT":
 		s.uploadAsset(w, r)
 	case r.URL.Path == "/mcp" && r.Method == "POST":
 		s.mcp(w, r)
+	case strings.HasPrefix(r.URL.Path, "/a/"):
+		s.serveApp(w, r)
+	case strings.HasPrefix(r.URL.Path, "/p/") && (strings.HasSuffix(r.URL.Path, "/register") || strings.HasSuffix(r.URL.Path, "/login") || strings.HasSuffix(r.URL.Path, "/logout")):
+		rest := strings.TrimPrefix(r.URL.Path, "/p/")
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) == 2 {
+			slug := parts[0]
+			action := strings.TrimPrefix(parts[1], "/")
+			// parts[1] like register
+			s.handleUserAuth(w, r, slug, action)
+			return
+		}
+		http.NotFound(w, r)
 	case strings.HasPrefix(r.URL.Path, "/p/") && (r.Method == "GET" || r.Method == "HEAD"):
 		s.servePage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/") && r.Method == "GET" && s.cfg.AdminDir != "":

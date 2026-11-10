@@ -14,6 +14,38 @@ type request struct {
 	Params  json.RawMessage `json:"params"`
 }
 
+func mcpTools() []any {
+	return []any{
+		map[string]any{
+			"name":        "publish_page",
+			"description": "Publish one HTML/CSS/JS file to a site",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"site":    map[string]string{"type": "string", "description": "Site name (lowercase, digits, dashes); a publisher token may use any unlisted site"},
+					"path":    map[string]string{"type": "string", "description": "File path inside the site, e.g. veille/2026-11-03/index.html"},
+					"content": map[string]string{"type": "string", "description": "UTF-8 file content (HTML, CSS, JS, JSON, text)"},
+				},
+				"required": []string{"site", "path", "content"},
+			},
+		},
+		map[string]any{
+			"name":        "publish_app",
+			"description": "Publish a pre-bundled server-side mini-app",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"site":     map[string]string{"type": "string"},
+					"manifest": map[string]string{"type": "object", "description": "App manifest with name, routes, permissions, limits, and declared network allowlist"},
+					"entry":    map[string]string{"type": "string", "description": "Single pre-bundled JavaScript entry defining handle(request)"},
+				},
+				"required": []string{"site", "manifest", "entry"},
+			},
+		},
+		map[string]any{"name": "list_sites", "description": "List sites visible to the bot", "inputSchema": map[string]any{"type": "object"}},
+	}
+}
+
 func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 	actor, admin := s.actor(r)
 	if actor == "" {
@@ -42,7 +74,7 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		result = map[string]any{}
 	case "tools/list":
-		result = map[string]any{"tools": []any{map[string]any{"name": "publish_page", "description": "Publish one HTML/CSS/JS file to a site", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"site": map[string]string{"type": "string", "description": "Site name (lowercase, digits, dashes); a publisher token may use any unlisted site"}, "path": map[string]string{"type": "string", "description": "File path inside the site, e.g. veille/2026-11-03/index.html"}, "content": map[string]string{"type": "string", "description": "UTF-8 file content (HTML, CSS, JS, JSON, text)"}}, "required": []string{"site", "path", "content"}}}, map[string]any{"name": "list_sites", "description": "List sites visible to the bot", "inputSchema": map[string]any{"type": "object"}}}}
+		result = map[string]any{"tools": mcpTools()}
 	case "tools/call":
 		var p struct {
 			Name      string          `json:"name"`
@@ -54,8 +86,12 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		}
 		rr := httptest.NewRequest("GET", "/api/sites", nil)
 		rr.Header = r.Header.Clone()
-		if p.Name == "publish_page" {
-			rr = httptest.NewRequest("POST", "/api/publish", bytes.NewReader(p.Arguments))
+		if p.Name == "publish_page" || p.Name == "publish_app" {
+			endpoint := "/api/publish"
+			if p.Name == "publish_app" {
+				endpoint = "/api/apps"
+			}
+			rr = httptest.NewRequest("POST", endpoint, bytes.NewReader(p.Arguments))
 			rr.Header = r.Header.Clone()
 			rr.Header.Set("Authorization", r.Header.Get("Authorization"))
 		}
@@ -64,6 +100,8 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 			s.list(rw, rr)
 		} else if p.Name == "publish_page" {
 			s.publish(rw, rr, actor, admin)
+		} else if p.Name == "publish_app" {
+			s.publishApp(rw, rr, actor, admin)
 		} else {
 			rw.Code = 400
 			rw.Body.WriteString("unknown tool")
