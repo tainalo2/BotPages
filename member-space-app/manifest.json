@@ -1,0 +1,12 @@
+{
+  "name": "espace-membre",
+  "memory_mb": 48,
+  "routes": [
+    { "method": "GET", "path": "/" },
+    { "method": "POST", "path": "/register" },
+    { "method": "POST", "path": "/login" },
+    { "method": "POST", "path": "/logout" },
+    { "method": "GET", "path": "/whoami" }
+  ],
+  "timeout_ms": 2000
+}

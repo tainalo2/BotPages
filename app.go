@@ -799,7 +799,10 @@ func (s *Server) serveApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.releaseAppSlot(app.site.Name)
-	response, halt, err := s.executeApp(app, r, routePath, string(body))
+	response, halt, setCookies, err := s.executeApp(app, r, routePath, string(body))
+	for _, cookie := range setCookies {
+		w.Header().Add("Set-Cookie", cookie)
+	}
 	if halt == "timeout" {
 		http.Error(w, "app execution timed out", http.StatusGatewayTimeout)
 		return
@@ -884,7 +887,7 @@ func appHasRoute(manifest AppManifest, method, routePath string) bool {
 	return false
 }
 
-func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body string) (response appResponse, halt string, err error) {
+func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body string) (response appResponse, halt string, setCookies []string, err error) {
 	vm := goja.New()
 	vm.SetMaxCallStackSize(1024)
 	executionContext, cancelExecution := context.WithTimeout(r.Context(), app.manifest.timeout())
@@ -903,7 +906,7 @@ func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body stri
 		}
 		return vm.ToValue(string(contents))
 	}); err != nil {
-		return response, "", err
+		return response, "", nil, err
 	}
 	approved := s.approvedDomains(app.site, app.manifest)
 	if err := vm.Set("fetch", func(call goja.FunctionCall) goja.Value {
@@ -913,10 +916,19 @@ func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body stri
 		}
 		return value
 	}); err != nil {
-		return response, "", err
+		return response, "", nil, err
 	}
 	if err := s.bindSiteDatabase(executionContext, vm, app.site.Name); err != nil {
-		return response, "", err
+		return response, "", nil, err
+	}
+	store, err := s.ensureSiteDatabase(app.site.Name)
+	if err != nil {
+		return response, "", nil, err
+	}
+	cookiePath := "/a/" + app.site.Slug + "/" + app.manifest.Name
+	pendingCookies, err := s.bindMemberSession(executionContext, vm, r, cookiePath, app.site.Name, store)
+	if err != nil {
+		return response, "", nil, err
 	}
 
 	var haltMu sync.Mutex
@@ -1041,9 +1053,9 @@ func (s *Server) executeApp(app loadedApp, r *http.Request, routePath, body stri
 		halt = "timeout"
 	}
 	if halt != "" {
-		return response, halt, runErr
+		return response, halt, *pendingCookies, runErr
 	}
-	return response, "", runErr
+	return response, "", *pendingCookies, runErr
 }
 
 func (s *Server) fetchForApp(ctx context.Context, vm *goja.Runtime, approved map[string]bool, call goja.FunctionCall) (goja.Value, error) {
