@@ -4,11 +4,12 @@ COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
-FROM golang:1.24-alpine AS backend
+FROM golang:1.26-alpine AS backend
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum *.go ./
-COPY web/ ./web/
+COPY web/src.jsx ./web/src.jsx
+COPY member-space-app/ ./member-space-app/
 RUN go test ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /botpages .
 FROM alpine:3.21
 ARG VERSION=dev
