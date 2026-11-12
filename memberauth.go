@@ -11,9 +11,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/dop251/goja"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -28,9 +30,9 @@ import (
 const (
 	memberSessionCookieName = "botpages_session"
 	memberSessionTTL        = 24 * time.Hour
-	argon2idTime            = 1
-	argon2idMemoryKB        = 64 * 1024
-	argon2idThreads         = 4
+	argon2idTime            = 2
+	argon2idMemoryKB        = 19 * 1024
+	argon2idThreads         = 1
 	argon2idKeyLength       = 32
 	argon2idSaltLength      = 16
 )
@@ -266,4 +268,121 @@ func memberSessionSetCookie(path, token string, maxAge int) string {
 		cookie += fmt.Sprintf("; Max-Age=%d", maxAge)
 	}
 	return cookie
+}
+
+// bindMemberSession expose currentUser() et members.{register,login,logout}
+// au code goja de l'app. Le cookie de session (HttpOnly, Secure,
+// SameSite=Strict, scopé à cookiePath) n'est jamais lu ni écrit directement
+// par le code goja : seul le runtime Go manipule le jeton signé, et seules
+// des identités déjà vérifiées (id, username) lui sont exposées, jamais le
+// hash de mot de passe ni les sessions d'un autre site.
+func (s *Server) bindMemberSession(ctx context.Context, vm *goja.Runtime, r *http.Request, cookiePath, siteName string, store *siteDatabase) (*[]string, error) {
+	pending := &[]string{}
+
+	var incomingToken string
+	if cookie, err := r.Cookie(memberSessionCookieName); err == nil {
+		incomingToken = cookie.Value
+	}
+
+	resolveCurrentUser := func() *memberIdentity {
+		if incomingToken == "" {
+			return nil
+		}
+		key, err := memberSiteSessionKey(ctx, store)
+		if err != nil {
+			return nil
+		}
+		uid, version, err := verifyMemberSessionToken(key, incomingToken)
+		if err != nil {
+			return nil
+		}
+		username, currentVersion, err := memberByID(ctx, store, uid)
+		if err != nil || currentVersion != version {
+			return nil
+		}
+		return &memberIdentity{ID: uid, Username: username}
+	}
+
+	withStorageWrite := func(fn func() error) error {
+		storageLock := s.siteStorageLock(siteName)
+		if err := storageLock.LockContext(ctx); err != nil {
+			return err
+		}
+		defer storageLock.Unlock()
+		if err := store.writeMu.LockContext(ctx); err != nil {
+			return err
+		}
+		defer store.writeMu.Unlock()
+		return fn()
+	}
+
+	if err := vm.Set("currentUser", func(call goja.FunctionCall) goja.Value {
+		user := resolveCurrentUser()
+		if user == nil {
+			return goja.Null()
+		}
+		return vm.ToValue(map[string]any{"id": user.ID, "username": user.Username})
+	}); err != nil {
+		return nil, err
+	}
+
+	members := vm.NewObject()
+	if err := members.Set("register", func(call goja.FunctionCall) goja.Value {
+		username := call.Argument(0).String()
+		password := call.Argument(1).String()
+		err := withStorageWrite(func() error {
+			return registerMember(ctx, store, username, password)
+		})
+		if err != nil {
+			panic(vm.NewGoError(err))
+		}
+		return vm.ToValue(map[string]any{"ok": true})
+	}); err != nil {
+		return nil, err
+	}
+	if err := members.Set("login", func(call goja.FunctionCall) goja.Value {
+		username := call.Argument(0).String()
+		password := call.Argument(1).String()
+		var id, version int64
+		err := withStorageWrite(func() error {
+			var authErr error
+			id, version, authErr = authenticateMember(ctx, store, username, password)
+			return authErr
+		})
+		if err != nil {
+			return vm.ToValue(map[string]any{"ok": false})
+		}
+		key, err := memberSiteSessionKey(ctx, store)
+		if err != nil {
+			panic(vm.NewGoError(err))
+		}
+		token, err := issueMemberSessionToken(key, id, version)
+		if err != nil {
+			panic(vm.NewGoError(err))
+		}
+		incomingToken = token
+		*pending = append(*pending, memberSessionSetCookie(cookiePath, token, int(memberSessionTTL.Seconds())))
+		return vm.ToValue(map[string]any{"ok": true, "username": username})
+	}); err != nil {
+		return nil, err
+	}
+	if err := members.Set("logout", func(call goja.FunctionCall) goja.Value {
+		user := resolveCurrentUser()
+		if user != nil {
+			if err := withStorageWrite(func() error {
+				return logoutMember(ctx, store, user.ID)
+			}); err != nil {
+				panic(vm.NewGoError(err))
+			}
+		}
+		incomingToken = ""
+		*pending = append(*pending, memberSessionSetCookie(cookiePath, "", 0))
+		return vm.ToValue(map[string]any{"ok": true})
+	}); err != nil {
+		return nil, err
+	}
+	if err := vm.Set("members", members); err != nil {
+		return nil, err
+	}
+	return pending, nil
 }
