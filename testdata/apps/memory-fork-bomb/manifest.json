@@ -1,0 +1,6 @@
+{
+  "name": "memory-fork-bomb",
+  "routes": [{"method": "GET", "path": "/run"}],
+  "timeout_ms": 1000,
+  "memory_mb": 1
+}

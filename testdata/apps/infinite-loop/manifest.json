@@ -1,0 +1,6 @@
+{
+  "name": "infinite-loop",
+  "routes": [{"method": "GET", "path": "/run"}],
+  "timeout_ms": 50,
+  "memory_mb": 8
+}
