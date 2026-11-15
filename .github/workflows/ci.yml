@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, epic/ci-harness-tef70d77a]
+    branches: [main]
   pull_request:
     branches: [main]
 
