@@ -1,0 +1,6 @@
+{
+  "name": "cross-site-db",
+  "routes": [{"method": "GET", "path": "/run"}],
+  "timeout_ms": 500,
+  "memory_mb": 8
+}

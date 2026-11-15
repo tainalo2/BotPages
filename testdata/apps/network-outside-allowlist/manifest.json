@@ -1,0 +1,7 @@
+{
+  "name": "network-outside-allowlist",
+  "routes": [{"method": "GET", "path": "/run"}],
+  "network_allowlist": ["allowed.example"],
+  "timeout_ms": 500,
+  "memory_mb": 8
+}
